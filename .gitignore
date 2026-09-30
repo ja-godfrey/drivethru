@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble
+
+# Editors
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Demo scratch output (the committed GIF is demo/demo.gif)
+demo/tree/
+demo/frames/
+demo/*.mp4
+demo/*.webm
+
+# Test scratch output (fixtures are generated at test time)
+tests/tmp/
+tests/out/
+*.log
+
+# Release scratch (tarballs downloaded to compute the formula sha256)
+*.tar.gz

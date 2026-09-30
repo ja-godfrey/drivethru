@@ -1,0 +1,2351 @@
+#!/bin/bash
+#
+# drivethru - fuzzy-find anything in the Google Drive for desktop folders on a
+# Mac and get its web link: copy the share link, open it in the browser as the
+# right Google account, or reveal it in Finder.
+#
+# drivethru never talks to Google. Every link is built from metadata Drive for
+# desktop already keeps on disk:
+#   - the extended attribute com.google.drivefs.item-id#S on every synced item,
+#   - the small JSON files that stand in for Google Docs, Sheets, ... (.gdoc),
+#   - optionally, a private COPY of Drive's own SQLite cache (resource keys,
+#     shortcut targets, ids that copies inherited by mistake).
+#
+# docs/DESIGN.md is the contract for this script and its tests.
+#
+# Written for the stock macOS /bin/bash 3.2: no associative arrays, mapfile,
+# ${x,,}, namerefs or negative array indexes. Empty arrays are expanded as
+# ${a[@]+"${a[@]}"} because bash 3.2 treats them as unset under `set -u`.
+
+set -u
+
+VERSION=0.1.0
+PROG=drivethru
+
+# System tools by absolute path, so Homebrew GNU tools or a Python `xattr`
+# package earlier in PATH can't change behaviour.
+XATTR=/usr/bin/xattr
+PLUTIL=/usr/bin/plutil
+SQLITE=/usr/bin/sqlite3
+PBCOPY=/usr/bin/pbcopy
+OPEN=/usr/bin/open
+OSASCRIPT=/usr/bin/osascript
+FIND=/usr/bin/find
+STAT=/usr/bin/stat
+REALPATH=/bin/realpath
+FPCTL=/usr/bin/fileproviderctl
+MKTEMP=/usr/bin/mktemp
+ICONV=/usr/bin/iconv
+SED=/usr/bin/sed
+TR=/usr/bin/tr
+HEAD=/usr/bin/head
+LS=/bin/ls
+CP=/bin/cp
+RM=/bin/rm
+MKDIR=/bin/mkdir
+CHMOD=/bin/chmod
+SLEEP=/bin/sleep
+PRINTF=/usr/bin/printf
+GREP=/usr/bin/grep
+
+ID_XATTR='com.google.drivefs.item-id#S'          # the '#S' is part of the name
+DOMAIN_XATTR='com.apple.file-provider-domain-id'  # on each mount root
+MIME_SHORTCUT=application/vnd.google-apps.shortcut
+
+TAB=$'\t'
+NL=$'\n'
+ICON_FILE=$'Icon\r'   # Finder's custom-icon file; never a Drive item
+ID_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'
+
+# A resource key is "<digit>-" plus 22 characters, 24 in all. The same shape
+# as an SQLite GLOB, used to reject garbage bytes inside the DB query.
+KEY_GLOB="[0-9]-"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
+  KEY_GLOB="${KEY_GLOB}[A-Za-z0-9_-]"
+done
+
+IN_POPUP=0
+TMPD=""
+SELF=""
+
+# ------------------------------------------------------------------ basics --
+
+# Strip terminal controls (including OSC 52 clipboard commands) from human
+# messages. Structured list/search records deliberately preserve filenames.
+terminal_text() { printf '%s' "$1" | LC_ALL=C "$TR" -d '\000-\010\013-\037\177'; }
+
+msg() { printf '%s: %s\n' "$PROG" "$(terminal_text "$*")" >&2; }
+
+debug() {
+  if [ "${DRIVETHRU_DEBUG:-0}" = 1 ]; then
+    printf '%s: debug: %s\n' "$PROG" "$(terminal_text "$*")" >&2
+  fi
+  return 0
+}
+
+is_dry() { [ "${DRIVETHRU_DRY_RUN:-0}" = 1 ]; }
+
+# Exit, but in a popup window first let the user read an error.
+finish() {
+  local rc=$1
+  if [ "$IN_POPUP" = 1 ] && [ "$rc" != 0 ] && [ "$rc" != 130 ]; then
+    popup_pause
+  fi
+  exit "$rc"
+}
+
+die() { # MESSAGE [EXIT_CODE]
+  msg "$1"
+  finish "${2:-1}"
+}
+
+usage_error() {
+  msg "$1"
+  printf "Try '%s --help'.\n" "$PROG" >&2
+  finish 1
+}
+
+popup_pause() {
+  local key
+  printf '\nPress any key to close.' >&2
+  { IFS= read -rsn1 key </dev/tty; } 2>/dev/null
+  printf '\n' >&2
+}
+
+lower() { printf '%s' "$1" | "$TR" '[:upper:]' '[:lower:]'; }
+upper() { printf '%s' "$1" | "$TR" '[:lower:]' '[:upper:]'; }
+
+trim() { # prints $1 without leading/trailing whitespace
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+# Drive ids are [A-Za-z0-9_-]+ of many lengths (19..73 seen); never check length.
+valid_id() {
+  case $1 in
+    '' | *[!"$ID_CHARS"]*) return 1 ;;
+  esac
+  return 0
+}
+
+valid_key() {
+  [ "${#1}" = 24 ] || return 1
+  case ${1:0:1} in [0123456789]) ;; *) return 1 ;; esac
+  [ "${1:1:1}" = - ] || return 1
+  valid_id "${1:2}"
+}
+
+# POSIX single-quoting, understood by sh, bash, zsh and fish alike.
+sh_quote() {
+  local q="'"
+  printf "'%s'" "${1//$q/$q\\$q$q}"
+}
+
+sql_quote() { # the inside of a single-quoted SQL literal
+  local q="'"
+  printf '%s' "${1//$q/$q$q}"
+}
+
+add_query() { # URL PARAM
+  case $1 in
+    *\?*) printf '%s&%s' "$1" "$2" ;;
+    *) printf '%s?%s' "$1" "$2" ;;
+  esac
+}
+
+# Percent-encode everything but [A-Za-z0-9@._~-] (an email in a query string:
+# '+' would otherwise turn into a space).
+url_encode() {
+  local s=$1 out="" c i
+  local LC_ALL=C
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@._~-]) out=$out$c ;;
+      *) out=$out$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+make_tmpdir() {
+  local base=${TMPDIR:-/tmp}
+  [ -n "$TMPD" ] && return 0
+  # (not `mktemp -t`: on macOS it ignores $TMPDIR)
+  TMPD=$("$MKTEMP" -d "${base%/}/drivethru.XXXXXXXX" 2>/dev/null) || {
+    TMPD=""
+    return 1
+  }
+  "$CHMOD" 700 "$TMPD" 2>/dev/null
+  return 0
+}
+
+cleanup() {
+  if [ -n "$TMPD" ] && [ -d "$TMPD" ]; then
+    "$RM" -rf -- "${TMPD:?}"
+  fi
+}
+
+# with_timeout SECS CMD...: run CMD (stdout passes through), kill it after SECS.
+# Stock macOS has no timeout(1).
+with_timeout() {
+  local secs=$1 pid wd rc
+  shift
+  "$@" &
+  pid=$!
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    "$SLEEP" "$secs" &
+    s=$!
+    wait "$s"
+    kill "$pid" 2>/dev/null
+  ) </dev/null >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid"
+  rc=$?
+  kill "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  return "$rc"
+}
+
+# act LABEL CMD [ARGS...]: run CMD, or under DRIVETHRU_DRY_RUN=1 print
+# "drivethru: dry-run: LABEL ARGS..." instead.
+act() {
+  local label=$1 line a
+  shift
+  if is_dry; then
+    shift
+    line="$PROG: dry-run: $label"
+    for a in "$@"; do line="$line $a"; done
+    printf '%s\n' "$(terminal_text "$line")" >&2
+    return 0
+  fi
+  "$@"
+}
+
+setup_path() {
+  # Hotkey tools start processes with /usr/bin:/bin:/usr/sbin:/sbin.
+  PATH="/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:$HOME/.local/bin:$HOME/.fzf/bin:$HOME/.nix-profile/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+  export PATH
+  unset CDPATH
+}
+
+find_self() {
+  local d b
+  case $0 in
+    */*) d=${0%/*} b=${0##*/} ;;
+    *)
+      d=$(command -v -- "$0" 2>/dev/null) || d=""
+      case $d in */*) b=${d##*/} d=${d%/*} ;; *) d=. b=$0 ;; esac
+      ;;
+  esac
+  [ -n "$d" ] || d=/
+  d=$(cd -P -- "$d" 2>/dev/null && pwd -P) || d=$PWD
+  SELF=$d/$b
+}
+
+# ------------------------------------------------------------------ config --
+
+CFG_BROWSER=auto
+CFG_TERMINAL=""
+CFG_POPUP_SIZE=130x26
+CFG_DB=auto
+CFG_AFTER_OPEN=""
+CFG_NOTIFY=false
+CFG_LABEL_EMAILS=()
+CFG_LABEL_VALUES=()
+CFG_UNKNOWN=()   # "LINE: key" (reported by doctor only)
+CFG_JUNK=()      # "LINE: text" lines without key = value (doctor only)
+CFG_ERRORS=()    # invalid values for known keys
+
+config_file() { printf '%s' "${DRIVETHRU_CONFIG:-$HOME/.config/drivethru/config}"; }
+
+# Parse "key = value" lines. The file is never sourced or evaluated; only
+# after_open is ever executed, deliberately, when a browser tab was opened.
+load_config() {
+  local f line key val n=0
+  f=$(config_file)
+  [ -f "$f" ] || return 0
+  if [ ! -r "$f" ]; then
+    CFG_ERRORS+=("can't read $f")
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    line=$(trim "$line")
+    case $line in '' | '#'*) continue ;; esac
+    line=${line%%[[:space:]]#*}   # inline comment: whitespace then '#'
+    case $line in
+      *=*) ;;
+      *) CFG_JUNK+=("$n: $line"); continue ;;
+    esac
+    key=$(trim "${line%%=*}")
+    val=$(trim "${line#*=}")
+    if [ -z "$key" ]; then
+      CFG_JUNK+=("$n: $line")
+      continue
+    fi
+    case $key in
+      label.*)
+        val=${val//$TAB/ }
+        [ -n "$val" ] || continue
+        CFG_LABEL_EMAILS+=("$(lower "${key#label.}")")
+        CFG_LABEL_VALUES+=("$val")
+        ;;
+      browser) CFG_BROWSER=$(lower "$val") ;;
+      terminal) CFG_TERMINAL=$(lower "$val") ;;
+      popup_size) CFG_POPUP_SIZE=$(lower "$val") ;;
+      db) CFG_DB=$(lower "$val") ;;
+      after_open) CFG_AFTER_OPEN=$val ;;
+      notify) CFG_NOTIFY=$(lower "$val") ;;
+      *) CFG_UNKNOWN+=("$n: $key") ;;
+    esac
+  done <"$f"
+
+  case $CFG_BROWSER in
+    auto | default | chrome | chrome-beta | chrome-dev | chrome-canary) ;;
+    *) CFG_ERRORS+=("browser = $CFG_BROWSER (expected auto, default, chrome, chrome-beta, chrome-dev or chrome-canary)") ;;
+  esac
+  case $CFG_TERMINAL in
+    '' | auto | ghostty | kitty | wezterm | alacritty | iterm2 | iterm | terminal) ;;
+    *) CFG_ERRORS+=("terminal = $CFG_TERMINAL (expected ghostty, kitty, wezterm, alacritty, iterm2 or terminal)") ;;
+  esac
+  parse_size "$CFG_POPUP_SIZE" || CFG_ERRORS+=("popup_size = $CFG_POPUP_SIZE (expected COLUMNSxROWS, e.g. 130x26)")
+  case $CFG_DB in
+    auto | off) ;;
+    *) CFG_ERRORS+=("db = $CFG_DB (expected auto or off)") ;;
+  esac
+  case $CFG_NOTIFY in
+    true | yes | on | 1) CFG_NOTIFY=true ;;
+    false | no | off | 0) CFG_NOTIFY=false ;;
+    *) CFG_ERRORS+=("notify = $CFG_NOTIFY (expected true or false)") ;;
+  esac
+  return 0
+}
+
+require_valid_config() {
+  local e
+  [ ${#CFG_ERRORS[@]} -gt 0 ] || return 0
+  for e in "${CFG_ERRORS[@]}"; do msg "config error in $(config_file): $e"; done
+  finish 1
+}
+
+POPUP_W=130
+POPUP_H=26
+parse_size() { # "WxH" -> POPUP_W POPUP_H
+  local w h
+  case $1 in
+    *x*) w=${1%%x*} h=${1#*x} ;;
+    *) return 1 ;;
+  esac
+  case $w in '' | *[!0123456789]*) return 1 ;; esac
+  case $h in '' | *[!0123456789]*) return 1 ;; esac
+  [ "$w" -ge 10 ] && [ "$h" -ge 4 ] || return 1
+  POPUP_W=$w
+  POPUP_H=$h
+}
+
+# ------------------------------------------------------------------ mounts --
+#
+# One File Provider mount per signed-in account: $ROOT/GoogleDrive-<email>/.
+# Always derived from $HOME (the Homebrew test sandbox sets HOME).
+
+ROOT_GIVEN=""
+ROOT_DIR=""
+MOUNTS=()
+EMAILS=()
+LABELS=()
+READABLE=()
+READ_WARNINGS=0
+ACTION_WARNINGS=0
+
+discover_mounts() {
+  local d
+  ROOT_GIVEN=${DRIVETHRU_ROOT:-$HOME/Library/CloudStorage}
+  MOUNTS=() EMAILS=()
+  [ -d "$ROOT_GIVEN" ] || return 0
+  real_path "$ROOT_GIVEN" || return 0
+  ROOT_DIR=$REAL_RESULT
+  for d in "$ROOT_DIR"/GoogleDrive-*; do
+    [ -d "$d" ] || continue
+    MOUNTS+=("$d")
+    EMAILS+=("${d##*/GoogleDrive-}")
+  done
+  compute_labels
+}
+
+default_label() { # EMAIL: gmail -> local part, else first label of the domain
+  local e=$1 domain
+  domain=${e##*@}
+  case $(lower "$domain") in
+    gmail.com | googlemail.com) printf '%s' "${e%@*}" ;;
+    *) printf '%s' "${domain%%.*}" ;;
+  esac
+}
+
+# Replace colliding labels by the full email of every colliding account.
+dedupe_labels() {
+  local i j n=${#LABELS[@]}
+  local -a out=()
+  for ((i = 0; i < n; i++)); do
+    out[i]=${LABELS[i]}
+    for ((j = 0; j < n; j++)); do
+      if [ "$i" != "$j" ] && [ "${LABELS[i]}" = "${LABELS[j]}" ]; then
+        out[i]=${EMAILS[i]}
+        break
+      fi
+    done
+  done
+  LABELS=(${out[@]+"${out[@]}"})
+}
+
+compute_labels() {
+  local i j e n=${#MOUNTS[@]}
+  LABELS=()
+  for ((i = 0; i < n; i++)); do
+    LABELS[i]=$(default_label "${EMAILS[i]}")
+  done
+  dedupe_labels
+  for ((i = 0; i < n; i++)); do
+    e=$(lower "${EMAILS[i]}")
+    for ((j = 0; j < ${#CFG_LABEL_EMAILS[@]}; j++)); do
+      [ "${CFG_LABEL_EMAILS[j]}" = "$e" ] && LABELS[i]=${CFG_LABEL_VALUES[j]}
+    done
+  done
+  dedupe_labels
+}
+
+mount_for_label() { # LABEL -> FOUND_MI
+  local i
+  FOUND_MI=-1
+  for ((i = 0; i < ${#LABELS[@]}; i++)); do
+    if [ "${LABELS[i]}" = "$1" ]; then
+      FOUND_MI=$i
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_mount() { # CANONICAL_PATH -> FOUND_MI
+  local i
+  FOUND_MI=-1
+  for ((i = 0; i < ${#MOUNTS[@]}; i++)); do
+    case $1 in
+      "${MOUNTS[i]}" | "${MOUNTS[i]}"/*)
+        FOUND_MI=$i
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+mount_readable() { "$LS" -A "$1" >/dev/null 2>&1; }
+
+perm_msg() { # EMAIL
+  printf "can't read the Google Drive folder of %s (permission denied). macOS asks each app once for access to \"files managed by Google Drive\"; allow it for this app in System Settings > Privacy & Security > Files & Folders (or give it Full Disk Access), then try again" "$1"
+}
+
+require_mounts() {
+  [ ${#MOUNTS[@]} -gt 0 ] && return 0
+  die "no Google Drive folders found in $ROOT_GIVEN (is Google Drive for desktop installed and signed in?)" 2
+}
+
+# Check every mount can be listed; warn about the others; exit 6 if none can.
+require_readable() {
+  local i ok=0
+  READABLE=()
+  for ((i = 0; i < ${#MOUNTS[@]}; i++)); do
+    if mount_readable "${MOUNTS[i]}"; then
+      READABLE[i]=1
+      ok=$((ok + 1))
+    else
+      READABLE[i]=0
+      READ_WARNINGS=1
+      msg "$(perm_msg "${EMAILS[i]}")"
+    fi
+  done
+  [ "$ok" -gt 0 ] || finish 6
+}
+
+# ----------------------------------------------------------------- listing --
+
+# Stream NUL-terminated "label<TAB>relative/path" rows: one find per mount,
+# pruning every name starting with '.' (.Trash, .tmp, .shortcut-targets-by-id,
+# .Encrypted, .DS_Store, ...) and Icon\r, never following symlinks (shortcut
+# targets are absolute paths; following would duplicate trees or loop).
+list_rows() {
+  local i fmt label
+  for ((i = 0; i < ${#MOUNTS[@]}; i++)); do
+    [ "${READABLE[i]:-1}" = 1 ] || continue
+    label=${LABELS[i]//\\/\\\\}
+    label=${label//%/%%}
+    fmt="$label"$'\t'"%s\\0"
+    (
+      cd -P -- "${MOUNTS[i]}" 2>/dev/null || exit 0
+      starts=()
+      for name in *; do
+        [ -e "$name" ] || [ -L "$name" ] || continue
+        [ "$name" = "$ICON_FILE" ] && continue
+        starts+=(-f "$name")   # BSD find: -f PATH also works for names starting with '-'
+      done
+      [ ${#starts[@]} -gt 0 ] || exit 0
+      exec "$FIND" "${starts[@]}" \( -name '.*' -o -name "$ICON_FILE" \) -prune \
+        -o -exec "$PRINTF" "$fmt" {} + 2>/dev/null
+    )
+  done
+}
+
+# --------------------------------------------------------------------- fzf --
+
+FZF=""
+# locate_fzf -> FZF (empty when missing). DRIVETHRU_FZF (test hook) names the
+# binary instead of the PATH lookup; a path that isn't executable means
+# "missing", which is how the tests reach exit 5 on a Mac that has fzf.
+locate_fzf() {
+  if [ -n "${DRIVETHRU_FZF:-}" ]; then
+    FZF=""
+    [ -f "$DRIVETHRU_FZF" ] && [ -x "$DRIVETHRU_FZF" ] && FZF=$DRIVETHRU_FZF
+  else
+    FZF=$(command -v fzf 2>/dev/null) || FZF=""
+  fi
+  [ -n "$FZF" ]
+}
+
+find_fzf() {
+  local v major minor rest
+  locate_fzf || die "fzf is not installed; install it with: brew install fzf" 5
+  v=$("$FZF" --version 2>/dev/null) || v=""
+  v=${v%% *}
+  major=${v%%.*}
+  rest=${v#*.}
+  minor=${rest%%.*}
+  case $major$minor in '' | *[!0123456789]*) return 0 ;; esac
+  if [ "$major" -eq 0 ] && [ "$minor" -lt 42 ]; then
+    die "fzf $v is too old; drivethru needs 0.42 or newer (brew upgrade fzf)" 5
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ Drive items --
+
+read_id() { # PATH: the item id; follows symlinks (a shortcut gives its TARGET's id)
+  local v
+  v=$("$XATTR" -p "$ID_XATTR" "$1" 2>/dev/null) || return 0
+  valid_id "$v" && printf '%s' "$v"
+  return 0
+}
+
+read_own_id() { # PATH: the symlink's own id (a shortcut's own id)
+  local v
+  v=$("$XATTR" -s -p "$ID_XATTR" "$1" 2>/dev/null) || return 0
+  valid_id "$v" && printf '%s' "$v"
+  return 0
+}
+
+stub_ext() { # NAME: prints the Google-native placeholder extension, if any
+  local ext
+  case $1 in *.*) ext=$(lower "${1##*.}") ;; *) return 0 ;; esac
+  # Authoritative list: CFBundleDocumentTypes of Google Drive.app. .gs and
+  # .geojson are ordinary files.
+  case $ext in
+    gdoc | gsheet | gslides | gform | gdraw | gscript | gmap | gsite | gjam | gvid | \
+      gtable | gnote | gmaillayout | glink | gprj | gpic | gcse | gdrive)
+      printf '%s' "$ext"
+      ;;
+  esac
+}
+
+kind_from_name() {
+  local ext
+  ext=$(stub_ext "$1")
+  case $ext in
+    '') printf 'file' ;;
+    gdoc | gsheet | gslides | gform | gdraw | gscript | gmap | gdrive) printf '%s' "$ext" ;;
+    *) printf 'gother' ;;
+  esac
+}
+
+kind_from_mime() {
+  case $1 in
+    application/vnd.google-apps.folder) printf 'folder' ;;
+    application/vnd.google-apps.document) printf 'gdoc' ;;
+    application/vnd.google-apps.spreadsheet) printf 'gsheet' ;;
+    application/vnd.google-apps.presentation) printf 'gslides' ;;
+    application/vnd.google-apps.form) printf 'gform' ;;
+    application/vnd.google-apps.drawing) printf 'gdraw' ;;
+    application/vnd.google-apps.script) printf 'gscript' ;;
+    application/vnd.google-apps.map) printf 'gmap' ;;
+    "$MIME_SHORTCUT" | '') ;;
+    application/vnd.google-apps.*) printf 'gother' ;;
+    *) printf 'file' ;;
+  esac
+}
+
+share_url() { # KIND ID [RESOURCE_KEY]
+  local u
+  case $1 in
+    folder | shared-drive | computer) u="https://drive.google.com/drive/folders/$2" ;;
+    gdoc) u="https://docs.google.com/document/d/$2/edit" ;;
+    gsheet) u="https://docs.google.com/spreadsheets/d/$2/edit" ;;
+    gslides) u="https://docs.google.com/presentation/d/$2/edit" ;;
+    gform) u="https://docs.google.com/forms/d/$2/edit" ;;
+    gdraw) u="https://docs.google.com/drawings/d/$2/edit" ;;
+    gscript) u="https://script.google.com/d/$2/edit" ;;
+    gmap) u="https://www.google.com/maps/d/edit?mid=$2" ;;
+    gdrive | file) u="https://drive.google.com/file/d/$2/view" ;;
+    *) u="https://drive.google.com/open?id=$2" ;;   # other g* stubs, broken shortcuts
+  esac
+  if valid_key "${3:-}"; then
+    u=$(add_query "$u" "resourcekey=$3")
+  fi
+  printf '%s' "$u"
+}
+
+display_name() { # NAME: without a placeholder extension (Plan.gdoc -> Plan)
+  local ext
+  ext=$(stub_ext "$1")
+  if [ -n "$ext" ]; then printf '%s' "${1%.*}"; else printf '%s' "$1"; fi
+}
+
+# canon_path PATH -> CANON: absolute, the parent directory resolved with
+# realpath (so aliases like "~/me@example.com - Google Drive" work), the final
+# component kept as-is (so a shortcut symlink stays a shortcut).
+# A sentinel preserves trailing newlines through command substitution. Remove
+# only realpath's final output separator, never newlines in the path itself.
+real_path() { # PATH -> REAL_RESULT
+  local result
+  result=$("$REALPATH" -- "$1" 2>/dev/null && printf '.') || return 1
+  result=${result%.}
+  REAL_RESULT=${result%"$NL"}
+}
+
+canon_path() {
+  local p=$1 dir base parent
+  CANON=""
+  [ -n "$p" ] || return 1
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
+  case $p in
+    */*) dir=${p%/*} base=${p##*/} ;;
+    *) dir=. base=$p ;;
+  esac
+  [ -n "$dir" ] || dir=/
+  case $base in
+    '' | . | ..)
+      real_path "$p" || return 1
+      CANON=$REAL_RESULT
+      ;;
+    *)
+      real_path "$dir" || return 1
+      parent=$REAL_RESULT
+      if [ "$parent" = / ]; then CANON=/$base; else CANON=$parent/$base; fi
+      [ -e "$CANON" ] || [ -L "$CANON" ] || return 1
+      # Normalize directory spelling on case-insensitive APFS, but retain a
+      # final symlink so it can still be identified as a Drive shortcut.
+      if [ -d "$CANON" ] && [ ! -L "$CANON" ]; then
+        real_path "$CANON" || return 1
+        CANON=$REAL_RESULT
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------- DriveFS DB (optional) --
+#
+# Drive for desktop keeps a private SQLite cache per account. Opening the live
+# file, even read-only, writes its WAL index (and macOS then tags it), so we
+# clone metadata_sqlite_db and its -wal/-shm into a private temp dir, query
+# the copy and delete it on exit. Any failure means: silently use the xattr.
+
+DB_STATE=()   # per mount index: ok | fail
+DB_FILE=""
+
+drivefs_dir() { printf '%s' "${DRIVETHRU_DRIVEFS_DIR:-$HOME/Library/Application Support/Google/DriveFS}"; }
+
+# The account dir is DriveFS/<N>, where <N> is the suffix of the mount root's
+# com.apple.file-provider-domain-id ("com.google.drivefs.fpext/gdrive-<N>").
+# Fallback: DriveFS/<N>/my-drive is a symlink to that mount's My Drive.
+drivefs_account_dir() { # MOUNT_INDEX
+  local m=${MOUNTS[$1]} dfs v n d t
+  dfs=$(drivefs_dir)
+  v=$("$XATTR" -p "$DOMAIN_XATTR" "$m" 2>/dev/null) || v=""
+  n=${v##*gdrive-}
+  if [ -n "$v" ] && [ "$n" != "$v" ] && valid_id "$n" && [ -d "$dfs/$n" ]; then
+    printf '%s' "$dfs/$n"
+    return 0
+  fi
+  for d in "$dfs"/*; do
+    [ -L "$d/my-drive" ] || continue
+    t=$(cd -P -- "$d/my-drive/.." 2>/dev/null && pwd -P) || continue
+    if [ "$t" = "$m" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+dbq() { # SQL: query only the private copy; preserve SQL failures for debug.
+  local rc error_file=$TMPD/sqlite-error
+  "$SQLITE" -init /dev/null -batch -noheader -separator '|' "$DB_FILE" "$1" 2>"$error_file"
+  rc=$?
+  if [ "$rc" != 0 ]; then debug "db: query failed: $(<"$error_file")"; fi
+  return "$rc"
+}
+
+db_schema_ok() {
+  local r
+  r=$(dbq "SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('items', 'stable_ids', 'stable_parents', 'shortcut_details')) || ':' || (SELECT count(*) FROM pragma_table_info('items') WHERE name IN ('stable_id', 'id', 'proto', 'mime_type', 'is_folder', 'local_title', 'is_tombstone')) || ':' || (SELECT count(*) FROM pragma_table_info('stable_ids') WHERE name IN ('stable_id', 'cloud_id')) || ':' || (SELECT count(*) FROM pragma_table_info('stable_parents') WHERE name IN ('item_stable_id', 'parent_stable_id')) || ':' || (SELECT count(*) FROM pragma_table_info('shortcut_details') WHERE name IN ('shortcut_stable_id', 'target_stable_id', 'target_mime_type'));")
+  [ "$r" = "4:7:2:2:3" ]
+}
+
+db_prepare() { # MOUNT_INDEX
+  local mi=$1 acct src dir s attempt
+  acct=$(drivefs_account_dir "$mi") || {
+    debug "db: no DriveFS account folder for ${EMAILS[mi]} in $(drivefs_dir); using xattrs only"
+    return 1
+  }
+  src=$acct/metadata_sqlite_db
+  if [ ! -f "$src" ] || [ ! -r "$src" ]; then
+    debug "db: $src not found; using xattrs only"
+    return 1
+  fi
+  make_tmpdir || return 1
+  dir=$TMPD/db$mi
+  for attempt in 1 2; do
+    "$RM" -rf -- "${dir:?}"
+    "$MKDIR" -m 700 "$dir" || return 1
+    for s in "" -wal -shm; do
+      [ -f "$src$s" ] || continue
+      # cp -c clones on APFS (instant, even for a 130 MB DB); plain cp otherwise
+      "$CP" -c "$src$s" "$dir/metadata_sqlite_db$s" 2>/dev/null ||
+        "$CP" "$src$s" "$dir/metadata_sqlite_db$s" 2>/dev/null || continue 2
+    done
+    DB_FILE=$dir/metadata_sqlite_db
+    if db_schema_ok; then
+      debug "db: using a private copy of $src"
+      return 0
+    fi
+    debug "db: copy $attempt of $src is unreadable or has an unexpected schema"
+  done
+  "$RM" -rf -- "${dir:?}"
+  debug "db: ignoring the database; using xattrs only"
+  return 1
+}
+
+db_ready() { # MOUNT_INDEX -> DB_FILE
+  local mi=$1
+  [ "$CFG_DB" = off ] && return 1
+  case ${DB_STATE[mi]:-} in
+    ok)
+      DB_FILE=$TMPD/db$mi/metadata_sqlite_db
+      return 0
+      ;;
+    fail) return 1 ;;
+  esac
+  if db_prepare "$mi"; then
+    DB_STATE[mi]=ok
+    return 0
+  fi
+  DB_STATE[mi]=fail
+  return 1
+}
+
+# fileproviderctl is only used for paths under the real ~/Library/CloudStorage.
+use_fileproviderctl() {
+  local real
+  [ -x "$FPCTL" ] || return 1
+  real=$(cd -P -- "$HOME/Library/CloudStorage" 2>/dev/null && pwd -P) || return 1
+  case $1 in "$real"/*) return 0 ;; esac
+  return 1
+}
+
+# The File Provider itemIdentifier of a path (= DriveFS items.stable_id).
+fp_item_identifier() {
+  local out
+  out=$(with_timeout 5 "$FPCTL" evaluate "$1" 2>/dev/null) || return 0
+  printf '%s\n' "$out" | "$SED" -n 's/^[[:space:]]*itemIdentifier = \([0-9][0-9]*\);$/\1/p' | "$HEAD" -n 1
+}
+
+nfc() { # NFD -> NFC (names on disk and in the DB may differ only by this)
+  local r
+  r=$(printf '%s' "$1" | "$ICONV" -f UTF-8-MAC -t UTF-8 2>/dev/null) && [ -n "$r" ] && {
+    printf '%s' "$r"
+    return
+  }
+  printf '%s' "$1"
+}
+
+nfd() {
+  local r
+  r=$(printf '%s' "$1" | "$ICONV" -f UTF-8 -t UTF-8-MAC 2>/dev/null) && [ -n "$r" ] && {
+    printf '%s' "$r"
+    return
+  }
+  printf '%s' "$1"
+}
+
+# The id Drive itself has for the item at PATH. A copy made inside Drive can
+# keep its source's xattr id even after it uploads and gets its own, so the
+# xattr (XATTR_ID) alone may point at another file.
+#   1. fileproviderctl itemIdentifier -> stable_ids.cloud_id   (real mounts)
+#   2. parent folder id + name -> items.local_title            (any tree)
+db_auth_id() { # PATH XATTR_ID
+  local p=$1 x=$2 sid cid par n1 n2 n3 rows count
+  if use_fileproviderctl "$p"; then
+    sid=$(fp_item_identifier "$p")
+    case $sid in
+      '' | *[!0123456789]*) debug "db: fileproviderctl gave no item identifier" ;;
+      *)
+        cid=$(dbq "SELECT cloud_id FROM stable_ids WHERE stable_id = $sid;")
+        if valid_id "$cid"; then
+          debug "db: File Provider item $sid is $cid"
+          printf '%s' "$cid"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  par=$(read_id "${p%/*}")
+  valid_id "$par" || return 0
+  n1=${p##*/}
+  n2=$(nfc "$n1")
+  n3=$(nfd "$n1")
+  rows=$(dbq "SELECT c.id FROM items p JOIN stable_parents sp ON sp.parent_stable_id = p.stable_id JOIN items c ON c.stable_id = sp.item_stable_id WHERE p.id = '$par' AND c.is_tombstone = 0 AND c.local_title IN ('$(sql_quote "$n1")', '$(sql_quote "$n2")', '$(sql_quote "$n3")');")
+  count=0
+  [ -n "$rows" ] && count=$(printf '%s\n' "$rows" | "$GREP" -c .)
+  if [ "$count" = 1 ] && valid_id "$rows"; then
+    debug "db: parent $par + name -> $rows"
+    printf '%s' "$rows"
+  elif [ "$count" -gt 1 ]; then
+    case "$NL$rows$NL" in *"$NL$x$NL"*) printf '%s' "$x" ;; esac
+  fi
+  return 0
+}
+
+# Resource key = protobuf field 140 of items.proto: bytes E2 08 18 (tag and
+# length 24), then 24 ASCII bytes. proto has TEXT affinity, hence the CAST.
+# key_sql BLOB_EXPR TAG_HEX TAG_LEN -> SQL giving the validated key or ''.
+key_sql() {
+  printf "coalesce((SELECT k FROM (SELECT CASE WHEN instr(%s, X'%s') > 0 THEN CAST(substr(%s, instr(%s, X'%s') + %s, 24) AS TEXT) END AS k) WHERE k GLOB '%s'), '')" \
+    "$1" "$2" "$1" "$1" "$2" "$3" "$KEY_GLOB"
+}
+
+# db_item_info ID -> DBI_MIME DBI_KEY DBI_TID DBI_TMIME DBI_TKEY
+# A shortcut's target comes from shortcut_details + stable_ids; the target's
+# key from the target's own field 140, else from the shortcut's field 132.7
+# (tag 3A 18 inside field 132, whose tag is A2 08).
+db_item_info() {
+  local id=$1 row b tb sub key132=""
+  DBI_MIME="" DBI_KEY="" DBI_TID="" DBI_TMIME="" DBI_TKEY=""
+  valid_id "$id" || return 1
+  b="CAST(i.proto AS BLOB)"
+  tb="CAST(tt.proto AS BLOB)"
+  sub="substr($b, instr($b, X'A208'))"
+  row=$(dbq "SELECT i.mime_type, $(key_sql "$b" E20818 3), coalesce(t.cloud_id, ''), coalesce(d.target_mime_type, ''), coalesce((SELECT $(key_sql "$tb" E20818 3) FROM items tt WHERE tt.stable_id = d.target_stable_id), ''), CASE WHEN instr($b, X'A208') > 0 THEN $(key_sql "$sub" 3A18 2) ELSE '' END FROM items i LEFT JOIN shortcut_details d ON d.shortcut_stable_id = i.stable_id LEFT JOIN stable_ids t ON t.stable_id = d.target_stable_id WHERE i.id = '$id' AND i.is_tombstone = 0 LIMIT 1;")
+  [ -n "$row" ] || return 1
+  # '|' never occurs in ids, mime types or (GLOB-checked) keys; a TAB would
+  # be IFS whitespace and collapse empty fields.
+  IFS='|' read -r DBI_MIME DBI_KEY DBI_TID DBI_TMIME DBI_TKEY key132 <<<"$row"
+  valid_key "$DBI_KEY" || DBI_KEY=""
+  valid_id "$DBI_TID" || DBI_TID=""
+  valid_key "$DBI_TKEY" || DBI_TKEY=""
+  if [ -z "$DBI_TKEY" ] && valid_key "$key132"; then DBI_TKEY=$key132; fi
+  return 0
+}
+
+# ------------------------------------------------------------- resolution --
+#
+# resolve_path PATH [full|light] fills the R_* globals:
+#   R_RC/R_ERR     0, or the exit code and message when there is no share link
+#   R_SHARE        the clean share link ("" when none)
+#   R_OPEN_BASE    what `open` opens (share link, or my-drive etc.)
+#   R_KIND R_ID R_KEY R_NAME R_DISPLAY R_MI R_PATH R_REL R_VIA R_WARNS
+# "light" (the picker preview) reads one xattr and never file contents or DB.
+
+r_reset() {
+  R_RC=0 R_ERR="" R_SHARE="" R_OPEN_BASE="" R_KIND="" R_ID="" R_KEY=""
+  R_NAME="" R_DISPLAY="" R_MI=-1 R_PATH="" R_REL="" R_VIA="" R_MODE=full
+  R_WARNS=()
+}
+
+r_warn() { R_WARNS+=("$1"); }
+
+resolve_path() {
+  local p=$1
+  r_reset
+  R_MODE=${2:-full}
+  if ! canon_path "$p"; then
+    R_RC=1
+    R_ERR="no such file or folder"
+    # an unreadable mount (missing File Provider consent) looks like this
+    local i
+    for ((i = 0; i < ${#MOUNTS[@]}; i++)); do
+      case $p in
+        "${MOUNTS[i]}"/* | "$ROOT_GIVEN/GoogleDrive-${EMAILS[i]}"/*)
+          if ! mount_readable "${MOUNTS[i]}"; then
+            R_RC=6
+            R_ERR=$(perm_msg "${EMAILS[i]}")
+          fi
+          ;;
+      esac
+    done
+    return 1
+  fi
+  R_PATH=$CANON
+  R_NAME=${R_PATH##*/}
+  R_DISPLAY=$(display_name "$R_NAME")
+  if ! find_mount "$R_PATH"; then
+    R_RC=3
+    R_ERR="not in a Google Drive folder; drivethru only trusts Drive ids under $ROOT_GIVEN/GoogleDrive-*"
+    return 1
+  fi
+  R_MI=$FOUND_MI
+  R_REL=${R_PATH#"${MOUNTS[R_MI]}"}
+  R_REL=${R_REL#/}
+  resolve_at "$R_PATH" "$R_MI"
+}
+
+# Folder names are localized ("Meine Ablage", ...), so the top levels are
+# identified by structure, never by name:
+#   depth 1 with an id     = My Drive root
+#   depth 1 without an id  = virtual container (Shared drives, Other computers)
+#   depth 2 under one      = shared-drive root (or a computer)
+resolve_at() { # CANONICAL_PATH MOUNT_INDEX
+  local p=$1 mi=$2 m rel first rest id
+  m=${MOUNTS[mi]}
+  rel=${p#"$m"}
+  rel=${rel#/}
+  if [ -z "$rel" ]; then
+    R_KIND=mount
+    R_OPEN_BASE="https://drive.google.com/"
+    R_RC=4
+    R_ERR="this is the account's whole Google Drive folder; it has no share link"
+    return 1
+  fi
+  first=${rel%%/*}
+  case $first in
+    .*)
+      if [ "$rel" = "$first" ] && [ -d "$p" ]; then
+        R_KIND=internal
+        R_RC=3
+        R_ERR="$first is Drive for desktop's own bookkeeping folder, not a Drive item"
+        return 1
+      fi
+      resolve_item "$p"
+      return
+      ;;
+  esac
+  if [ "$rel" = "$first" ] && [ -d "$p" ] && [ ! -L "$p" ]; then
+    id=$(read_id "$p")
+    if [ -n "$id" ]; then
+      R_KIND=mydrive
+      R_ID=$id
+      R_OPEN_BASE="https://drive.google.com/drive/my-drive"
+      R_RC=4
+      R_ERR="My Drive itself can't be shared"
+      return 1
+    fi
+    R_KIND=container
+    if is_shared_drives_container "$p"; then
+      R_OPEN_BASE="https://drive.google.com/drive/shared-drives"
+    else
+      R_OPEN_BASE="https://drive.google.com/"
+    fi
+    R_RC=4
+    R_ERR="$first is a Drive for desktop container, not a Drive item; it has no share link"
+    return 1
+  fi
+  rest=${rel#*/}
+  if [ "$rel" != "$first" ] && [ "$rest" = "${rest%%/*}" ] &&
+    [ -d "$p" ] && [ ! -L "$p" ] && [ -z "$(read_id "$m/$first")" ]; then
+    if is_shared_drives_container "$m/$first"; then
+      R_KIND=shared-drive
+    else
+      R_KIND=computer
+    fi
+    R_ID=$(read_id "$p")
+    if [ -z "$R_ID" ]; then
+      no_id_error "$p" "$mi"
+      return 1
+    fi
+    debug "id source: xattr (shared-drive root)"
+    R_SHARE=$(share_url shared-drive "$R_ID")
+    R_OPEN_BASE=$R_SHARE
+    return 0
+  fi
+  resolve_item "$p"
+}
+
+is_shared_drives_container() { # DIR
+  local d=$1 c id out
+  if use_fileproviderctl "$d"; then
+    out=$(with_timeout 5 "$FPCTL" evaluate "$d" 2>/dev/null) || out=""
+    case $out in
+      *'itemIdentifier = DFSFileProviderSharedDrivesIdentifier;'*) return 0 ;;
+      *'itemIdentifier = '*) return 1 ;;
+    esac
+  fi
+  # Shared-drive roots have 19-character ids starting with 0A.
+  for c in "$d"/*; do
+    [ -d "$c" ] || continue
+    id=$(read_id "$c")
+    [ -n "$id" ] || continue
+    case $id in 0A*) return 0 ;; esac
+    return 1
+  done
+  return 1
+}
+
+no_id_error() { # PATH MOUNT_INDEX
+  local name=${1##*/}
+  if ! mount_readable "${MOUNTS[$2]}"; then
+    R_RC=6
+    R_ERR=$(perm_msg "${EMAILS[$2]}")
+    return
+  fi
+  R_RC=3
+  case $name in
+    .DS_Store) R_ERR=".DS_Store is a local Finder file, not a Drive item" ;;
+    "$ICON_FILE") R_ERR="this is a local Finder icon file, not a Drive item" ;;
+    *)
+      case $R_REL in
+        .*) R_ERR="this is inside ${R_REL%%/*}, Drive for desktop's own bookkeeping folder; it has no Drive id" ;;
+        *) R_ERR="not uploaded to Drive yet (Drive for desktop hasn't given it an id; check that it finished syncing)" ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
+resolve_item() { # PATH (a regular item or a shortcut)
+  if [ -L "$1" ]; then
+    resolve_symlink "$1"
+  else
+    resolve_regular "$1"
+  fi
+}
+
+# Shortcut forms 1-3 (symlinks). `xattr -p` follows the link to the target.
+resolve_symlink() {
+  local p=$1 sid target
+  if [ ! -e "$p" ]; then
+    # Form 3: broken symlink; only the shortcut's own id is known.
+    sid=$(read_own_id "$p")
+    if [ -z "$sid" ]; then
+      no_id_error "$p" "$R_MI"
+      return 1
+    fi
+    debug "id source: the shortcut's own xattr (xattr -s); its target isn't available"
+    R_KIND=broken-shortcut
+    R_ID=$sid
+    R_SHARE=$(share_url broken-shortcut "$sid")
+    R_OPEN_BASE=$R_SHARE
+    R_DISPLAY=$R_NAME
+    r_warn "shortcut target isn't available locally; this link points at the shortcut"
+    return 0
+  fi
+  if real_path "$p"; then target=$REAL_RESULT; else target=""; fi
+  if [ -z "$target" ] || ! find_mount "$target"; then
+    R_RC=3
+    R_ERR="this symlink points outside Google Drive; its id can't be trusted"
+    return 1
+  fi
+  debug "shortcut symlink: using its target"
+  R_VIA=shortcut
+  R_MI=$FOUND_MI
+  resolve_at "$target" "$FOUND_MI"
+}
+
+# Regular files and folders, including shortcut form 4 (a regular file that
+# stands in for a target with no visible parent).
+resolve_regular() {
+  local p=$1 x kind is_stub=0 sdoc="" skey="" auth from_db=0 authoritative=0 db_known=0
+  if [ -d "$p" ]; then kind=folder; else kind=$(kind_from_name "${p##*/}"); fi
+  R_KIND=$kind
+  x=$(read_id "$p")
+  if [ -z "$x" ] && [ "$R_MODE" = full ] && db_ready "$R_MI"; then
+    # Some uploaded files never get the xattr; Drive's DB still knows them.
+    x=$(db_auth_id "$p" "")
+    if [ -n "$x" ]; then
+      debug "id source: no id xattr, but Drive's database knows this item as $x"
+      from_db=1
+      authoritative=1
+    fi
+  fi
+  if [ -z "$x" ]; then
+    no_id_error "$p" "$R_MI"
+    return 1
+  fi
+  R_ID=$x
+  [ "$from_db" = 1 ] || debug "id source: xattr $ID_XATTR"
+  if [ "$R_MODE" = full ]; then
+    case $kind in folder | file) ;; *) [ -f "$p" ] && is_stub=1 ;; esac
+    if [ "$is_stub" = 1 ]; then
+      # One small JSON file for the selected item only. Always -o -: without
+      # it, plutil -extract rewrites the file. `raw` fails on JSON null.
+      sdoc=$(with_timeout 10 "$PLUTIL" -extract doc_id raw -o - "$p" 2>/dev/null) || sdoc=""
+      valid_id "$sdoc" || sdoc=""
+      skey=$(with_timeout 10 "$PLUTIL" -extract resource_key raw -o - "$p" 2>/dev/null) || skey=""
+      valid_key "$skey" || skey=""
+    fi
+    if [ "$from_db" = 0 ] && db_ready "$R_MI"; then
+      auth=$(db_auth_id "$p" "$x")
+      if [ -n "$auth" ] && [ "$auth" != "$x" ]; then
+        debug "db: the xattr id belongs to another item (a copy keeps its source's id); using $auth"
+        x=$auth
+        sdoc="" skey=""   # the stub's content was copied along with it
+      fi
+      [ -n "$auth" ] && authoritative=1
+    fi
+    if [ "${DB_STATE[R_MI]:-}" = ok ] && db_item_info "$x"; then
+      db_known=1
+      # An uploaded copy may lack an xattr yet retain its source's JSON.
+      # Only a DB shortcut is entitled to redirect an authoritative item id.
+      if [ "$authoritative" = 1 ] && [ "$DBI_MIME" != "$MIME_SHORTCUT" ] && [ "$sdoc" != "$x" ]; then
+        sdoc="" skey=""
+      fi
+    elif [ "$from_db" = 1 ]; then
+      sdoc="" skey=""
+    fi
+    R_ID=$x
+    if [ -n "$sdoc" ] && [ "$sdoc" != "$x" ]; then
+      # Stub stand-in: the xattr is the SHORTCUT id, doc_id the TARGET id.
+      debug "id source: the placeholder's doc_id (this is a shortcut stand-in)"
+      R_ID=$sdoc
+      R_VIA=shortcut
+    fi
+    R_KEY=$skey
+    if [ "$db_known" = 1 ]; then
+      debug "db: $x is $DBI_MIME"
+      if [ "$DBI_MIME" = "$MIME_SHORTCUT" ] && [ -n "$DBI_TID" ]; then
+        # Share the TARGET: a shortcut's ACL is its parent folder's, so
+        # recipients often can't open the shortcut id.
+        debug "db: shortcut -> target $DBI_TID ($DBI_TMIME)"
+        [ "$DBI_TID" = "$sdoc" ] || R_KEY=""
+        R_ID=$DBI_TID
+        R_VIA=shortcut
+        [ -n "$DBI_TKEY" ] && R_KEY=$DBI_TKEY
+        case $R_KIND in
+          file | folder)
+            kind=$(kind_from_mime "$DBI_TMIME")
+            [ -n "$kind" ] && R_KIND=$kind
+            ;;
+        esac
+      elif [ "$R_ID" = "$x" ] && [ -n "$DBI_KEY" ]; then
+        R_KEY=$DBI_KEY
+      fi
+      if [ -z "$R_KEY" ] && [ "$R_ID" != "$x" ] && db_item_info "$R_ID"; then
+        R_KEY=$DBI_KEY
+      fi
+      if [ -n "$R_KEY" ]; then debug "db: resource key found"; fi
+    fi
+    valid_key "$R_KEY" || R_KEY=""
+    case $R_ID in
+      0B*)
+        # Legacy (pre-2017) ids: link-shared ones need a resource key for
+        # people who haven't opened them before.
+        [ -n "$R_KEY" ] || r_warn "legacy item: people who haven't opened it before may need a resource key that drivethru couldn't read"
+        ;;
+    esac
+    if [ "$R_KIND" = gform ]; then
+      r_warn "this is the form's editor link; respondents need the link from Send in Google Forms"
+    fi
+  fi
+  R_SHARE=$(share_url "$R_KIND" "$R_ID" "$R_KEY")
+  R_OPEN_BASE=$R_SHARE
+  return 0
+}
+
+print_warnings() { # NAME
+  local w
+  for w in ${R_WARNS[@]+"${R_WARNS[@]}"}; do
+    ACTION_WARNINGS=1
+    msg "$1: $w"
+  done
+}
+
+md_escape() { # text for inside [ ] of a Markdown link
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\[/\\[}
+  s=${s//\]/\\]}
+  s=${s//$NL/ }
+  terminal_text "$s"
+}
+
+# --------------------------------------------------------------- actions --
+
+copy_to_clipboard() { # TEXT
+  if is_dry; then
+    printf '%s: dry-run: pbcopy %s\n' "$PROG" "$(terminal_text "${1//$NL/ }")" >&2
+    if [ -n "${DRIVETHRU_CLIPBOARD_FILE:-}" ]; then
+      printf '%s' "$1" >"$DRIVETHRU_CLIPBOARD_FILE"
+    fi
+    return 0
+  fi
+  # pbcopy picks the text encoding from the locale; hotkey tools often have none.
+  printf '%s' "$1" | LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 "$PBCOPY"
+}
+
+notify() { # MESSAGE
+  if is_dry; then
+    printf '%s: dry-run: notify %s\n' "$PROG" "$(terminal_text "${1//$NL/ }")" >&2
+    return 0
+  fi
+  with_timeout 5 "$OSASCRIPT" -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "drivethru"' \
+    -e 'end run' -- "$1" >/dev/null 2>&1
+  return 0
+}
+
+reveal_in_finder() { # PATH...
+  act open "$OPEN" -R "$@"
+}
+
+run_after_open() { # EMAIL URL PROFILE_DIR
+  [ -n "$CFG_AFTER_OPEN" ] || return 0
+  if is_dry; then
+    printf '%s: dry-run: after_open %s\n' "$PROG" "$(terminal_text "$CFG_AFTER_OPEN")" >&2
+    return 0
+  fi
+  debug "after_open: running the configured command"
+  DRIVETHRU_EMAIL=$1 DRIVETHRU_URL=$2 DRIVETHRU_PROFILE_DIR=$3 \
+    /bin/bash -c "$CFG_AFTER_OPEN" </dev/null >&2
+  return 0
+}
+
+# link_items FORMAT(plain|markdown) COPY NOTIFY PATH...
+# Prints one result per line; copies them all; returns the first error code.
+LINKS_COPIED=0
+LINKS_FIRST_NAME=""
+link_items() {
+  local fmt=$1 copy=$2 want_notify=$3 p line out="" n=0 nfail=0 rc=0 first_err="" first_warning=""
+  shift 3
+  LINKS_COPIED=0
+  LINKS_FIRST_NAME=""
+  for p in "$@"; do
+    resolve_path "$p" full
+    print_warnings "${R_NAME:-$p}"
+    if [ -z "$first_warning" ] && [ ${#R_WARNS[@]} -gt 0 ]; then
+      first_warning=${R_WARNS[0]}
+    fi
+    if [ -z "$R_SHARE" ]; then
+      msg "${R_NAME:-$p}: $R_ERR"
+      if [ "$rc" = 0 ]; then rc=${R_RC:-3}; [ "$rc" = 0 ] && rc=3; fi
+      nfail=$((nfail + 1))
+      [ -n "$first_err" ] || first_err="${R_DISPLAY:-$p}: $R_ERR"
+      continue
+    fi
+    if [ "$fmt" = markdown ]; then
+      line="[$(md_escape "$R_DISPLAY")]($R_SHARE)"
+    else
+      line=$R_SHARE
+    fi
+    printf '%s\n' "$line"
+    out=${out:+$out$NL}$line
+    n=$((n + 1))
+    [ -n "$LINKS_FIRST_NAME" ] || LINKS_FIRST_NAME=$R_DISPLAY
+  done
+  if [ "$copy" = 1 ] && [ "$n" -gt 0 ]; then
+    copy_to_clipboard "$out"
+    LINKS_COPIED=$n
+  fi
+  if [ "$want_notify" = 1 ]; then
+    local note
+    if [ "$n" -gt 0 ]; then
+      if [ "$copy" = 1 ]; then
+        if [ "$n" = 1 ]; then note="Copied link to $LINKS_FIRST_NAME"; else note="Copied $n links"; fi
+      else
+        note=$out
+      fi
+      [ "$nfail" -gt 0 ] && note="$note; $nfail failed ($first_err)"
+      [ -n "$first_warning" ] && note="$note; $first_warning"
+    else
+      note="No link: $first_err"
+    fi
+    notify "$note"
+  fi
+  return "$rc"
+}
+
+open_items() { # PATH...
+  local p url rc=0
+  for p in "$@"; do
+    resolve_path "$p" full
+    print_warnings "${R_NAME:-$p}"
+    if [ -z "$R_OPEN_BASE" ]; then
+      msg "${R_NAME:-$p}: $R_ERR"
+      [ "$rc" = 0 ] && rc=${R_RC:-3}
+      continue
+    fi
+    # Copied links stay clean; only what we open picks the account.
+    url=$(add_query "$R_OPEN_BASE" "authuser=$(url_encode "${EMAILS[R_MI]}")")
+    if ! open_in_browser "$url" "${EMAILS[R_MI]}"; then
+      [ "$rc" = 0 ] && rc=1
+      continue
+    fi
+    run_after_open "${EMAILS[R_MI]}" "$url" "$OPENED_PROFILE_DIR"
+  done
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- browser --
+
+BROWSER_INFO_DONE=0
+DEFAULT_BROWSER=""
+INSTALLED_CHROMES=""
+
+chrome_bundle_for() { # CONFIG_NAME
+  case $1 in
+    chrome) printf 'com.google.Chrome' ;;
+    chrome-beta) printf 'com.google.Chrome.beta' ;;
+    chrome-dev) printf 'com.google.Chrome.dev' ;;
+    chrome-canary) printf 'com.google.Chrome.canary' ;;
+  esac
+}
+
+chrome_name_for() {
+  case $1 in
+    com.google.Chrome) printf 'Google Chrome' ;;
+    com.google.Chrome.beta) printf 'Google Chrome Beta' ;;
+    com.google.Chrome.dev) printf 'Google Chrome Dev' ;;
+    com.google.Chrome.canary) printf 'Google Chrome Canary' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+chrome_user_data_dir() { # BUNDLE_ID
+  if [ -n "${DRIVETHRU_CHROME_DIR:-}" ]; then
+    printf '%s' "$DRIVETHRU_CHROME_DIR"
+    return
+  fi
+  printf '%s/Library/Application Support/%s' "$HOME" "$(chrome_name_for "$1" | "$SED" 's/^Google Chrome/Google\/Chrome/')"
+}
+
+# One JXA call: the default https handler, then the installed Chrome channels.
+browser_info() {
+  local out line first=1
+  [ "$BROWSER_INFO_DONE" = 1 ] && return 0
+  BROWSER_INFO_DONE=1
+  out=$(with_timeout 10 "$OSASCRIPT" -l JavaScript -e '
+ObjC.import("AppKit");
+var ws = $.NSWorkspace.sharedWorkspace, out = [], d = "";
+var u = ws.URLForApplicationToOpenURL($.NSURL.URLWithString("https://example.com/"));
+if (!u.isNil()) {
+  var b = $.NSBundle.bundleWithURL(u);
+  if (!b.isNil() && !b.bundleIdentifier.isNil()) d = b.bundleIdentifier.js;
+}
+out.push(d);
+["com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.dev", "com.google.Chrome.canary"].forEach(function (id) {
+  if (!ws.URLForApplicationWithBundleIdentifier(id).isNil()) out.push(id);
+});
+out.join("\n");' 2>/dev/null) || out=""
+  while IFS= read -r line; do
+    if [ "$first" = 1 ]; then
+      DEFAULT_BROWSER=$line
+      first=0
+    elif [ -n "$line" ]; then
+      INSTALLED_CHROMES="$INSTALLED_CHROMES $line"
+    fi
+  done <<<"$out"
+  debug "browser: default is ${DEFAULT_BROWSER:-unknown}; Chrome channels installed:${INSTALLED_CHROMES:- none}"
+}
+
+# Chrome compares emails like gaia::AreEmailsSame: lowercase (ASCII), treat
+# googlemail.com as gmail.com, ignore dots in gmail local parts. Filters stay
+# jq-1.6 compatible (macOS 15's jq): no regex builtins.
+# shellcheck disable=SC2016  # jq filter, not shell
+JQ_CANON='def canon: tostring | ascii_downcase | split("@") as $p
+  | if ($p | length) == 2 then
+      (if $p[1] == "googlemail.com" then "gmail.com" else $p[1] end) as $d
+      | (if $d == "gmail.com" then ($p[0] | split(".") | join("")) else $p[0] end) + "@" + $d
+    else . end;'
+
+# chrome_profile_for_email USER_DATA_DIR EMAIL: prints the profile dir.
+# Primary accounts (Local State info_cache[dir].user_name) win over accounts
+# signed in on the web (<dir>/Preferences account_info[].email). Profiles
+# come from info_cache keys only (never "System Profile"/"Guest Profile").
+chrome_profile_for_email() {
+  local udd=$1 email=$2 jq=${DRIVETHRU_JQ:-/usr/bin/jq} dir dirs n
+  [ -f "$udd/Local State" ] || return 0
+  [ -n "$email" ] || return 0
+  if [ -x "$jq" ]; then
+    # shellcheck disable=SC2016  # jq filter, not shell
+    dir=$("$jq" -r --arg e "$email" "$JQ_CANON"'
+      ($e | canon) as $w
+      | [(.profile.info_cache // {}) | to_entries[]
+         | select(.key != "System Profile" and .key != "Guest Profile")
+         | select((.value.user_name // "" | canon) == $w) | .key] | .[0] // empty' \
+      "$udd/Local State" 2>/dev/null)
+    if [ -n "$dir" ]; then
+      debug "browser: $email is the primary account of Chrome profile \"$dir\""
+      printf '%s' "$dir"
+      return 0
+    fi
+    dirs=$("$jq" -r '(.profile.info_cache // {}) | keys_unsorted[]
+      | select(. != "System Profile" and . != "Guest Profile")' "$udd/Local State" 2>/dev/null)
+    while IFS= read -r dir; do
+      [ -n "$dir" ] && [ -f "$udd/$dir/Preferences" ] || continue
+      # shellcheck disable=SC2016  # jq filter, not shell
+      n=$("$jq" -r --arg e "$email" "$JQ_CANON"'
+        ($e | canon) as $w | [(.account_info // [])[] | (.email // "" | canon) | select(. == $w)] | length' \
+        "$udd/$dir/Preferences" 2>/dev/null)
+      case $n in '' | 0 | *[!0123456789]*) ;; *)
+        debug "browser: $email is signed in on the web in Chrome profile \"$dir\""
+        printf '%s' "$dir"
+        return 0
+        ;;
+      esac
+    done <<<"$dirs"
+    return 0
+  fi
+  # JXA fallback (macOS 14 and earlier have no /usr/bin/jq). JXA doesn't
+  # expand ~, so paths are absolute.
+  dir=$(with_timeout 10 "$OSASCRIPT" -l JavaScript -e '
+function run(a) {
+  ObjC.import("Foundation");
+  function rd(p) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError(p, 4, null);
+    return (s && !s.isNil()) ? s.js : null;
+  }
+  function canon(e) {
+    e = String(e === undefined || e === null ? "" : e).replace(/[A-Z]/g, function (c) { return c.toLowerCase(); });
+    var p = e.split("@");
+    if (p.length !== 2) return e;
+    var d = p[1] === "googlemail.com" ? "gmail.com" : p[1];
+    return (d === "gmail.com" ? p[0].split(".").join("") : p[0]) + "@" + d;
+  }
+  var udd = a[0], want = canon(a[1]), st, i, j;
+  if (!want) return "";
+  try { st = JSON.parse(rd(udd + "/Local State")); } catch (e) { return ""; }
+  var c = (st && st.profile && st.profile.info_cache) || {};
+  var dirs = Object.keys(c).filter(function (k) { return k !== "System Profile" && k !== "Guest Profile"; });
+  for (i = 0; i < dirs.length; i++) {
+    if (canon((c[dirs[i]] || {}).user_name) === want) return dirs[i];
+  }
+  for (i = 0; i < dirs.length; i++) {
+    var pr;
+    try { pr = JSON.parse(rd(udd + "/" + dirs[i] + "/Preferences")); } catch (e) { continue; }
+    var ai = (pr && pr.account_info) || [];
+    for (j = 0; j < ai.length; j++) {
+      if (canon((ai[j] || {}).email) === want) return dirs[i];
+    }
+  }
+  return "";
+}' -- "$udd" "$email" 2>/dev/null) || dir=""
+  if [ -n "$dir" ]; then
+    debug "browser: $email belongs to Chrome profile \"$dir\" (JXA)"
+    printf '%s' "$dir"
+  fi
+  return 0
+}
+
+# Verified on macOS 26 with Chrome running: `open -n -b ... --args` hands the
+# URL to the running Chrome, which opens it in the named profile. The extra
+# switches make a stale dir fall back to the email, then the last-used
+# profile, and never create a new empty profile.
+open_with_chrome() { # BUNDLE PROFILE_DIR EMAIL URL
+  local -a args=(-n -b "$1" --args)
+  if [ -n "$2" ]; then
+    args+=("--profile-directory=$2" --ignore-profile-directory-if-not-exists)
+  fi
+  args+=("--profile-email=$3" "$4")
+  act open "$OPEN" "${args[@]}"
+}
+
+ROUTE_KIND=default
+ROUTE_BUNDLE=""
+ROUTE_PROFILE_DIR=""
+ROUTE_ERROR=""
+# Keep diagnostics and actual launches on the same account/channel decision.
+browser_route() { # EMAIL; sets ROUTE_KIND, ROUTE_BUNDLE, ROUTE_PROFILE_DIR, ROUTE_ERROR
+  local email=$1 b chans="" dir forced=""
+  ROUTE_KIND=default ROUTE_BUNDLE="" ROUTE_PROFILE_DIR="" ROUTE_ERROR=""
+  if [ "$CFG_BROWSER" = default ]; then
+    debug "browser: default browser (browser = default)"
+    return 0
+  fi
+  if [ "$CFG_BROWSER" != auto ]; then
+    forced=$(chrome_bundle_for "$CFG_BROWSER")
+    if [ -z "$forced" ]; then
+      ROUTE_ERROR="unknown browser \"$CFG_BROWSER\""
+      return 1
+    fi
+  fi
+  if [ -n "${DRIVETHRU_CHROME_DIR:-}" ]; then
+    chans=${forced:-com.google.Chrome}   # test hook: that dir is the channel
+  else
+    browser_info
+    if [ -n "$forced" ]; then
+      case " $INSTALLED_CHROMES " in
+        *" $forced "*) chans=$forced ;;
+        *)
+          ROUTE_ERROR="browser = $CFG_BROWSER, but $(chrome_name_for "$forced") isn't installed"
+          return 1
+          ;;
+      esac
+    else
+      # the default browser first when it is a Chrome channel
+      for b in $INSTALLED_CHROMES; do
+        [ "$(lower "$b")" = "$(lower "$DEFAULT_BROWSER")" ] && chans=$b
+      done
+      for b in $INSTALLED_CHROMES; do
+        case " $chans " in *" $b "*) ;; *) chans="$chans $b" ;; esac
+      done
+    fi
+  fi
+  for b in $chans; do
+    dir=$(chrome_profile_for_email "$(chrome_user_data_dir "$b")" "$email")
+    if [ -n "$dir" ]; then
+      ROUTE_KIND=chrome ROUTE_BUNDLE=$b ROUTE_PROFILE_DIR=$dir
+      return 0
+    fi
+  done
+  if [ -n "$forced" ]; then
+    debug "browser: no $(chrome_name_for "$forced") profile for $email; letting Chrome pick by email"
+    ROUTE_KIND=chrome ROUTE_BUNDLE=$forced
+    return 0
+  fi
+  debug "browser: no Chrome profile for $email; default browser with authuser"
+  return 0
+}
+
+OPENED_PROFILE_DIR=""
+open_in_browser() { # URL EMAIL
+  OPENED_PROFILE_DIR=""
+  if ! browser_route "$2"; then
+    msg "$ROUTE_ERROR"
+    return 1
+  fi
+  OPENED_PROFILE_DIR=$ROUTE_PROFILE_DIR
+  if [ "$ROUTE_KIND" = chrome ]; then
+    open_with_chrome "$ROUTE_BUNDLE" "$ROUTE_PROFILE_DIR" "$2" "$1"
+  else
+    act open "$OPEN" "$1"
+  fi
+}
+
+# ------------------------------------------------------------------ picker --
+
+cmd_pick() { # [QUERY...]
+  local query="$*" out rc key row label rel header preview tabstop=2 i
+  local -a paths=()
+  # fzf without a terminal hangs on /dev/console instead of failing.
+  if ! { : </dev/tty; } 2>/dev/null; then
+    die "drivethru needs a terminal; use \`drivethru popup\` from hotkeys" 1
+  fi
+  require_valid_config
+  require_mounts
+  find_fzf
+  require_readable
+  [ "$IN_POPUP" = 1 ] && popup_float
+  make_tmpdir || die "can't create a temporary directory" 1
+  out=$TMPD/picked
+  for ((i = 0; i < ${#LABELS[@]}; i++)); do
+    [ $((${#LABELS[i]} + 2)) -gt "$tabstop" ] && tabstop=$((${#LABELS[i]} + 2))
+  done
+  header="enter copy link · ctrl-o open · ctrl-f reveal · ctrl-y copy Markdown · tab select · ctrl-p preview · esc quit"
+  preview="$(sh_quote "$SELF") __preview {}"
+  export SHELL=/bin/bash   # fzf runs --preview with $SHELL (may be zsh or fish)
+  list_rows | FZF_DEFAULT_OPTS='' FZF_DEFAULT_OPTS_FILE='' "$FZF" --read0 --print0 --multi --expect=ctrl-o,ctrl-f,ctrl-y \
+    --delimiter="$TAB" --tabstop="$tabstop" \
+    --layout=reverse --scheme=path --cycle --info=inline-right \
+    --prompt='drive> ' --header="$header" \
+    --preview="$preview" --preview-window='down,3,wrap,border-top' \
+    --bind='ctrl-p:toggle-preview' --query="$query" >"$out"
+  rc=$?
+  case $rc in
+    0) ;;
+    1 | 130) finish 130 ;;   # no match / esc / ctrl-c: print nothing
+    *) die "fzf failed (exit $rc)" 5 ;;
+  esac
+  {
+    IFS= read -r -d '' key
+    while IFS= read -r -d '' row; do
+      label=${row%%"$TAB"*}
+      rel=${row#*"$TAB"}
+      mount_for_label "$label" || continue
+      paths+=("${MOUNTS[FOUND_MI]}/$rel")
+    done
+  } <"$out"
+  [ ${#paths[@]} -gt 0 ] || finish 130
+  rc=0
+  case $key in
+    ctrl-o)
+      open_items "${paths[@]}" || rc=$?
+      ;;
+    ctrl-f)
+      reveal_in_finder "${paths[@]}" || rc=$?
+      ;;
+    *)
+      local fmt=plain notify_flag=0
+      [ "$key" = ctrl-y ] && fmt=markdown
+      [ "$CFG_NOTIFY" = true ] && notify_flag=1
+      link_items "$fmt" 1 "$notify_flag" "${paths[@]}" || rc=$?
+      if [ "$LINKS_COPIED" -gt 0 ]; then
+        if [ "$LINKS_COPIED" = 1 ]; then
+          printf 'Copied: %s\n' "$(terminal_text "$LINKS_FIRST_NAME")" >&2
+        else
+          printf 'Copied: %s links\n' "$LINKS_COPIED" >&2
+        fi
+        if [ "$IN_POPUP" = 1 ] && [ "$rc" = 0 ] && [ "$ACTION_WARNINGS" = 0 ] && [ "$READ_WARNINGS" = 0 ]; then
+          "$SLEEP" 0.6
+        fi
+      fi
+      ;;
+  esac
+  if [ "$IN_POPUP" = 1 ] && [ "$rc" = 0 ] && { [ "$ACTION_WARNINGS" = 1 ] || [ "$READ_WARNINGS" = 1 ]; }; then
+    popup_pause
+  fi
+  finish "$rc"
+}
+
+# Hidden: the picker's preview for one row ("label<TAB>relative/path").
+# Reads one xattr and stat; never file contents, never the DB.
+cmd_preview() {
+  local row=${1:-} label rel desc when email line2
+  label=${row%%"$TAB"*}
+  rel=${row#*"$TAB"}
+  mount_for_label "$label" || {
+    printf '%s\n' "$(terminal_text "$rel")"
+    return 0
+  }
+  email=${EMAILS[FOUND_MI]}
+  resolve_path "${MOUNTS[FOUND_MI]}/$rel" light
+  desc=$(kind_label "$R_KIND" "$R_NAME")
+  [ "$R_VIA" = shortcut ] && desc="Shortcut · $desc"
+  when=$("$STAT" -L -f '%Sm' -t '%Y-%m-%d %H:%M' "$R_PATH" 2>/dev/null) ||
+    when=$("$STAT" -f '%Sm' -t '%Y-%m-%d %H:%M' "$R_PATH" 2>/dev/null) || when=""
+  printf '%s · %s%s\n' "$(terminal_text "$desc")" "$(terminal_text "$email")" "${when:+ · modified $when}"
+  if [ -n "$R_SHARE" ]; then
+    # xattrs can be inherited by copies; shortcut targets/resource keys need
+    # full resolution. Never present this lightweight result as a share URL.
+    line2="Link resolved when copied or opened"
+  elif [ -n "$R_OPEN_BASE" ]; then
+    line2="no share link; ctrl-o opens $R_OPEN_BASE"
+  else
+    if [ "$R_RC" = 3 ] && [ -n "$R_KIND" ] && [ "$R_KIND" != internal ] && [ "$R_MI" -ge 0 ] &&
+      [ "$R_NAME" != .DS_Store ] && [ "$R_NAME" != "$ICON_FILE" ]; then
+      line2="Link resolved when copied or opened (no cached id)"
+    else
+      line2=$R_ERR
+    fi
+  fi
+  printf '%s\n' "$(terminal_text "$line2")"
+  return 0
+}
+
+kind_label() { # KIND NAME
+  local ext
+  case $1 in
+    folder) printf 'Folder' ;;
+    shared-drive) printf 'Shared drive' ;;
+    computer) printf 'Computer backup folder' ;;
+    mydrive) printf 'My Drive' ;;
+    container)
+      case $R_OPEN_BASE in
+        */shared-drives) printf 'Shared drives (container)' ;;
+        *) printf 'Drive for desktop container' ;;
+      esac
+      ;;
+    mount) printf 'Google Drive account folder' ;;
+    internal) printf 'Drive for desktop bookkeeping folder' ;;
+    broken-shortcut) printf 'Shortcut (target not available)' ;;
+    gdoc) printf 'Google Doc' ;;
+    gsheet) printf 'Google Sheet' ;;
+    gslides) printf 'Google Slides' ;;
+    gform) printf 'Google Form' ;;
+    gdraw) printf 'Google Drawing' ;;
+    gscript) printf 'Apps Script project' ;;
+    gmap) printf 'Google My Maps map' ;;
+    gdrive) printf '%s (download blocked by the owner)' "$(file_label "${2%.*}")" ;;
+    gother)
+      ext=$(stub_ext "$2")
+      case $ext in
+        gsite) printf 'Google Site' ;;
+        gjam) printf 'Jamboard' ;;
+        gvid) printf 'Google Vids video' ;;
+        gtable) printf 'Google Table' ;;
+        gnote) printf 'Google Note' ;;
+        gmaillayout) printf 'Email layout' ;;
+        glink) printf 'Google Drive link' ;;
+        gprj) printf 'Google Project' ;;
+        gpic) printf 'Google Pics' ;;
+        gcse) printf 'Encrypted Google file' ;;
+        *) printf 'Google file' ;;
+      esac
+      ;;
+    '') printf 'Item' ;;
+    *) file_label "$2" ;;
+  esac
+}
+
+file_label() { # NAME
+  local ext=""
+  case $1 in *.*) ext=$(lower "${1##*.}") ;; esac
+  case $ext in
+    pdf) printf 'PDF' ;;
+    doc | docx | rtf | odt) printf 'Word document' ;;
+    xls | xlsx | ods) printf 'Excel spreadsheet' ;;
+    ppt | pptx | odp) printf 'PowerPoint presentation' ;;
+    png | jpg | jpeg | gif | heic | webp | tif | tiff | bmp | svg) printf 'Image' ;;
+    mp4 | mov | m4v | avi | mkv | webm) printf 'Video' ;;
+    mp3 | m4a | wav | aac | flac | aiff) printf 'Audio' ;;
+    zip | tar | gz | tgz | 7z | rar | dmg) printf 'Archive' ;;
+    txt | md) printf 'Text file' ;;
+    csv) printf 'CSV file' ;;
+    key) printf 'Keynote presentation' ;;
+    pages) printf 'Pages document' ;;
+    numbers) printf 'Numbers spreadsheet' ;;
+    '') printf 'File' ;;
+    *) printf '%s file' "$(upper "$ext")" ;;
+  esac
+}
+
+# ------------------------------------------------------------------- popup --
+
+terminal_for_bundle() {
+  case $1 in
+    com.mitchellh.ghostty) printf 'ghostty' ;;
+    net.kovidgoyal.kitty) printf 'kitty' ;;
+    com.github.wez.wezterm) printf 'wezterm' ;;
+    org.alacritty) printf 'alacritty' ;;
+    com.googlecode.iterm2) printf 'iterm2' ;;
+    *) printf 'terminal' ;;
+  esac
+}
+
+detect_terminal() {
+  local b
+  b=$(with_timeout 10 "$OSASCRIPT" -l JavaScript -e '
+ObjC.import("AppKit");
+var ws = $.NSWorkspace.sharedWorkspace, r = "";
+var ids = ["com.mitchellh.ghostty", "net.kovidgoyal.kitty", "com.github.wez.wezterm",
+           "org.alacritty", "com.googlecode.iterm2", "com.apple.Terminal"];
+for (var i = 0; i < ids.length; i++) {
+  if (!ws.URLForApplicationWithBundleIdentifier(ids[i]).isNil()) { r = ids[i]; break; }
+}
+r;' 2>/dev/null) || b=""
+  terminal_for_bundle "$b"
+}
+
+POPUP_TERMINAL=""
+TERMINAL_ERROR=""
+resolve_terminal() { # NAME; same validation for popup and doctor, including env overrides
+  POPUP_TERMINAL=$(lower "$1")
+  TERMINAL_ERROR=""
+  case $POPUP_TERMINAL in
+    '' | auto) POPUP_TERMINAL=$(detect_terminal) ;;
+    iterm) POPUP_TERMINAL=iterm2 ;;
+    ghostty | kitty | wezterm | alacritty | iterm2 | terminal) ;;
+    *)
+      TERMINAL_ERROR="unknown terminal \"$POPUP_TERMINAL\" (expected ghostty, kitty, wezterm, alacritty, iterm2 or terminal)"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# AppleScript for Terminal.app: it leaves "[Process completed]" windows open,
+# so wait for the command to end and close the window ourselves.
+TERMINAL_SCRIPT='on run argv
+	set cmd to item 1 of argv
+	set w to (item 2 of argv) as integer
+	set h to (item 3 of argv) as integer
+	set wasRunning to application id "com.apple.Terminal" is running
+	tell application id "com.apple.Terminal"
+		if wasRunning then
+			set t to do script cmd
+		else
+			set t to do script cmd in window 1
+		end if
+		activate
+		try
+			set custom title of t to "drivethru"
+			set number of columns of t to w
+			set number of rows of t to h
+		end try
+		try
+			set tt to tty of t
+			repeat 100 times
+				if (count of (processes of t)) > 0 then exit repeat
+				delay 0.1
+			end repeat
+			repeat while (count of (processes of t)) > 0
+				delay 0.3
+			end repeat
+			repeat with x in windows
+				if tty of selected tab of x is tt then
+					close x
+					exit repeat
+				end if
+			end repeat
+		end try
+	end tell
+end run'
+
+ITERM_SCRIPT='on run argv
+	set cmd to item 1 of argv
+	set w to (item 2 of argv) as integer
+	set h to (item 3 of argv) as integer
+	tell application id "com.googlecode.iterm2"
+		set win to (create window with default profile command cmd)
+		try
+			tell current session of win
+				set columns to w
+				set rows to h
+			end tell
+		end try
+		activate
+	end tell
+end run'
+
+launch_applescript() { # NAME SCRIPT COMMAND
+  if is_dry; then
+    printf '%s: dry-run: osascript %s %s %sx%s\n' "$PROG" "$1" "$(terminal_text "$3")" "$POPUP_W" "$POPUP_H" >&2
+    return 0
+  fi
+  # The Terminal script waits for the popup to end, so supervise it in the
+  # background. Keep Automation denials and other launch errors visible after
+  # the hotkey process exits. Ignoring HUP lets the supervisor outlive it.
+  (
+    trap - EXIT INT TERM
+    trap '' HUP
+    local error rc
+    error=$(printf '%s\n' "$2" | "$OSASCRIPT" - "$3" "$POPUP_W" "$POPUP_H" 2>&1)
+    rc=$?
+    if [ "$rc" != 0 ]; then
+      popup_applescript_failed "$1" "$rc" "$error"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  return 0
+}
+
+popup_applescript_failed() { # NAME STATUS ERROR
+  /usr/bin/logger -t "$PROG" "couldn't open the $1 popup window (osascript exit $2): $3"
+  notify "Couldn't open the $1 popup. Check Automation permissions in System Settings and drivethru messages in Console."
+}
+
+cmd_popup() { # [QUERY...]
+  local query="$*" term
+  local -a tail=(--in-popup)
+  [ -n "$query" ] && tail+=("$query")
+  if [ ${#CFG_ERRORS[@]} -gt 0 ]; then
+    [ -t 2 ] || notify "Config error: ${CFG_ERRORS[0]}. Run drivethru doctor for details."
+    require_valid_config
+  fi
+  parse_size "$CFG_POPUP_SIZE"
+  if ! resolve_terminal "${DRIVETHRU_TERMINAL:-$CFG_TERMINAL}"; then
+    [ -t 2 ] || notify "$TERMINAL_ERROR"
+    die "$TERMINAL_ERROR" 1
+  fi
+  term=$POPUP_TERMINAL
+  debug "popup: $term ${POPUP_W}x$POPUP_H"
+  case $term in
+    ghostty)
+      act open "$OPEN" -na Ghostty --args --window-width="$POPUP_W" --window-height="$POPUP_H" \
+        --title=drivethru --confirm-close-surface=false --window-save-state=never \
+        --quit-after-last-window-closed=true -e "$SELF" "${tail[@]}"
+      ;;
+    kitty)
+      act open "$OPEN" -na kitty --args -o remember_window_size=no \
+        -o initial_window_width="${POPUP_W}c" -o initial_window_height="${POPUP_H}c" \
+        -o macos_quit_when_last_window_closed=yes -o confirm_os_window_close=0 \
+        --title drivethru "$SELF" "${tail[@]}"
+      ;;
+    wezterm)
+      act open "$OPEN" -na WezTerm --args --config initial_cols="$POPUP_W" \
+        --config initial_rows="$POPUP_H" start --always-new-process -- "$SELF" "${tail[@]}"
+      ;;
+    alacritty)
+      act open "$OPEN" -na Alacritty --args -o window.dimensions.columns="$POPUP_W" \
+        -o window.dimensions.lines="$POPUP_H" -T drivethru -e "$SELF" "${tail[@]}"
+      ;;
+    iterm2)
+      launch_applescript iterm2 "$ITERM_SCRIPT" "$(sh_quote "$SELF") --in-popup${query:+ $(sh_quote "$query")}"
+      ;;
+    terminal)
+      launch_applescript terminal "$TERMINAL_SCRIPT" "exec $(sh_quote "$SELF") --in-popup${query:+ $(sh_quote "$query")}"
+      ;;
+  esac
+  local rc=$?
+  if [ "$rc" != 0 ]; then
+    [ -t 2 ] || notify "drivethru couldn't open the $term popup window"
+    die "couldn't open the $term popup window" 5
+  fi
+  return 0
+}
+
+popup_bundle_id() { # the terminal we run in, from the variables it sets
+  case ${TERM_PROGRAM:-} in
+    ghostty) printf 'com.mitchellh.ghostty'; return ;;
+    iTerm.app) printf 'com.googlecode.iterm2'; return ;;
+    Apple_Terminal) printf 'com.apple.Terminal'; return ;;
+    WezTerm) printf 'com.github.wez.wezterm'; return ;;
+  esac
+  if [ -n "${KITTY_WINDOW_ID:-}" ]; then printf 'net.kovidgoyal.kitty'; return; fi
+  if [ -n "${ALACRITTY_WINDOW_ID:-}${ALACRITTY_SOCKET:-}" ]; then printf 'org.alacritty'; fi
+}
+
+# Tiling window managers: float the popup (AeroSpace), in the background so
+# the picker isn't delayed.
+popup_float() {
+  local want
+  command -v aerospace >/dev/null 2>&1 || return 0
+  want=$(popup_bundle_id)
+  [ -n "$want" ] || return 0
+  if is_dry; then
+    printf '%s: dry-run: aerospace layout floating\n' "$PROG" >&2
+    return 0
+  fi
+  (
+    i=0
+    while [ "$i" -lt 20 ]; do
+      b=$(aerospace list-windows --focused --format '%{app-bundle-id}' 2>/dev/null)
+      if [ "$b" = "$want" ]; then
+        aerospace layout floating
+        exit 0
+      fi
+      "$SLEEP" 0.1
+      i=$((i + 1))
+    done
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+# --------------------------------------------------------------- commands --
+
+cmd_link() {
+  local copy=0 md=0 notify_flag=0 fmt=plain
+  local -a paths=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --copy) copy=1 ;;
+      --markdown) md=1 ;;
+      --notify) notify_flag=1 ;;
+      --)
+        shift
+        paths+=("$@")
+        break
+        ;;
+      -?*) usage_error "link: unknown option $1" ;;
+      *) paths+=("$1") ;;
+    esac
+    shift
+  done
+  [ ${#paths[@]} -gt 0 ] || usage_error "link needs at least one PATH"
+  require_valid_config
+  [ "$CFG_NOTIFY" = true ] && notify_flag=1
+  if [ ${#MOUNTS[@]} = 0 ]; then
+    [ "$notify_flag" = 1 ] && notify "No Google Drive folders found"
+    require_mounts
+  fi
+  [ "$md" = 1 ] && fmt=markdown
+  local rc=0
+  link_items "$fmt" "$copy" "$notify_flag" "${paths[@]}" || rc=$?
+  finish "$rc"
+}
+
+cmd_open() {
+  local -a paths=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --)
+        shift
+        paths+=("$@")
+        break
+        ;;
+      -?*) usage_error "open: unknown option $1" ;;
+      *) paths+=("$1") ;;
+    esac
+    shift
+  done
+  [ ${#paths[@]} -gt 0 ] || usage_error "open needs at least one PATH"
+  require_valid_config
+  require_mounts
+  local rc=0
+  open_items "${paths[@]}" || rc=$?
+  finish "$rc"
+}
+
+cmd_search() {
+  local limit=10 links=0 copy_first=0 query out rc row n=0 label rel end_record='\n'
+  local -a words=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --limit)
+        [ $# -ge 2 ] || usage_error "search: --limit needs a number"
+        limit=$2
+        shift
+        ;;
+      --limit=*) limit=${1#--limit=} ;;
+      --links) links=1 ;;
+      --copy-first) copy_first=1 ;;
+      -0 | --null) end_record='\0' ;;
+      --)
+        shift
+        words+=("$@")
+        break
+        ;;
+      -?*) usage_error "search: unknown option $1" ;;
+      *) words+=("$1") ;;
+    esac
+    shift
+  done
+  case $limit in '' | 0 | *[!0123456789]*) usage_error "search: --limit needs a positive number" ;; esac
+  query="${words[*]+"${words[*]}"}"
+  [ -n "$query" ] || usage_error "search needs a QUERY"
+  require_valid_config
+  require_mounts
+  find_fzf
+  require_readable
+  make_tmpdir || die "can't create a temporary directory" 1
+  out=$TMPD/found
+  list_rows | FZF_DEFAULT_OPTS='' FZF_DEFAULT_OPTS_FILE='' "$FZF" --read0 --print0 --filter="$query" --delimiter="$TAB" --scheme=path >"$out" 2>/dev/null
+  rc=$?
+  case $rc in
+    0 | 1) ;;
+    *) die "fzf failed (exit $rc)" 5 ;;
+  esac
+  if [ "$copy_first" = 1 ]; then
+    IFS= read -r -d '' row <"$out" || die "no match for \"$query\"" 1
+    label=${row%%"$TAB"*}
+    rel=${row#*"$TAB"}
+    mount_for_label "$label" || die "no match for \"$query\"" 1
+    rc=0
+    link_items plain 1 0 "${MOUNTS[FOUND_MI]}/$rel" || rc=$?
+    finish "$rc"
+  fi
+  rc=0
+  while [ "$n" -lt "$limit" ] && IFS= read -r -d '' row <&3; do
+    n=$((n + 1))
+    if [ "$links" = 1 ]; then
+      label=${row%%"$TAB"*}
+      rel=${row#*"$TAB"}
+      R_SHARE=""
+      if mount_for_label "$label"; then
+        resolve_path "${MOUNTS[FOUND_MI]}/$rel" full
+        print_warnings "$R_NAME"
+        [ -n "$R_SHARE" ] || msg "$R_NAME: $R_ERR"
+      fi
+      printf '%s\t%s%b' "$row" "$R_SHARE" "$end_record"
+    else
+      printf '%s%b' "$row" "$end_record"
+    fi
+  done 3<"$out"
+  finish "$rc"
+}
+
+cmd_list() {
+  local null=0
+  if [ $# = 1 ]; then
+    case $1 in -0 | --null) null=1; shift ;; esac
+  fi
+  [ $# = 0 ] || usage_error "list accepts only -0 or --null"
+  require_valid_config
+  require_mounts
+  require_readable
+  if [ "$null" = 1 ]; then list_rows; else list_rows | "$TR" '\0' '\n'; fi
+  finish 0
+}
+
+share_dir() { # where the Finder Quick Action bundle lives (repo or install prefix)
+  local s d
+  s=$("$REALPATH" -- "$SELF" 2>/dev/null) || s=$SELF
+  d=${s%/*}
+  for c in "$d/share/drivethru" "$d/../share/drivethru"; do
+    if [ -d "$c" ]; then
+      (cd -P -- "$c" && pwd -P)
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_install_quick_action() {
+  local sd src dest_dir dest name cmd new wflow
+  [ $# = 0 ] || usage_error "install-quick-action takes no arguments"
+  sd=$(share_dir) || die "can't find the Quick Action bundle (share/drivethru next to $SELF)" 1
+  src=""
+  for c in "$sd"/*.workflow; do
+    [ -d "$c" ] && { src=$c; break; }
+  done
+  [ -n "$src" ] || die "no .workflow bundle in $sd" 1
+  name=${src##*/}
+  dest_dir=$HOME/Library/Services
+  dest=$dest_dir/$name
+  if is_dry; then
+    printf '%s: dry-run: install %s %s\n' "$PROG" "$src" "$dest" >&2
+    printf '%s: dry-run: pbs -update\n' "$PROG" >&2
+    finish 0
+  fi
+  "$MKDIR" -p "$dest_dir" || die "can't create $dest_dir" 1
+  case $dest in "$dest_dir"/?*.workflow) [ -e "$dest" ] && "$RM" -rf -- "${dest:?}" ;; esac
+  "$CP" -R "$src" "$dest" || die "can't copy $src to $dest_dir" 1
+  "$XATTR" -dr com.apple.quarantine "$dest" 2>/dev/null
+  # The Quick Action runs `drivethru` with PATH=/opt/homebrew/bin:/usr/local/bin
+  # plus the system dirs; point it at this script when that wouldn't find it.
+  wflow=$dest/Contents/document.wflow
+  if ! PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin command -v drivethru >/dev/null 2>&1; then
+    cmd=$("$PLUTIL" -extract actions.0.action.ActionParameters.COMMAND_STRING raw -o - "$wflow" 2>/dev/null) || cmd=""
+    case $cmd in
+      *'drivethru link'*)
+        new=${cmd//drivethru link/$(sh_quote "$SELF") link}
+        "$PLUTIL" -replace actions.0.action.ActionParameters.COMMAND_STRING -string "$new" "$wflow" 2>/dev/null ||
+          msg "warning: couldn't point the Quick Action at $SELF; put drivethru on PATH"
+        ;;
+    esac
+  fi
+  [ -x /System/Library/CoreServices/pbs ] && /System/Library/CoreServices/pbs -update >/dev/null 2>&1
+  printf 'Installed "%s" in %s.\n' "${name%.workflow}" "$dest_dir"
+  printf 'In Finder, right-click a Drive item > Quick Actions > %s.\n' "${name%.workflow}"
+  printf 'To give it a shortcut: System Settings > Keyboard > Keyboard Shortcuts > Services > Files and Folders.\n'
+  finish 0
+}
+
+# ------------------------------------------------------------------ doctor --
+
+cmd_doctor() {
+  local problems=0 rc=0 i v f n mdc cont acct dfs e line
+  [ $# = 0 ] || usage_error "doctor takes no arguments"
+  say() { printf '  %-5s %s\n' "$1" "$(terminal_text "$2")"; }
+  printf 'drivethru %s doctor\n' "$VERSION"
+
+  v=$(/usr/bin/sw_vers -productVersion 2>/dev/null) || v=""
+  case ${v%%.*} in
+    '' | *[!0123456789]*) say warn "couldn't read the macOS version" ;;
+    *) if [ "${v%%.*}" -ge 13 ]; then say ok "macOS $v"; else say warn "macOS $v: drivethru needs macOS 13 or later"; fi ;;
+  esac
+
+  if locate_fzf; then
+    v=$("$FZF" --version 2>/dev/null)
+    v=${v%% *}
+    local fmaj=${v%%.*} fr=${v#*.}
+    local fmin=${fr%%.*}
+    case $fmaj$fmin in
+      '' | *[!0123456789]*) say ok "fzf $v ($FZF)" ;;
+      *)
+        if [ "$fmaj" -eq 0 ] && [ "$fmin" -lt 42 ]; then
+          say FAIL "fzf $v is too old; the picker needs 0.42 or newer (brew upgrade fzf)"
+          problems=$((problems + 1))
+          [ "$rc" = 0 ] && rc=5
+        else
+          say ok "fzf $v ($FZF)"
+        fi
+        ;;
+    esac
+  else
+    say FAIL "fzf not found; the picker and search need it: brew install fzf"
+    problems=$((problems + 1))
+    [ "$rc" = 0 ] && rc=5
+  fi
+  if [ -x "${DRIVETHRU_JQ:-/usr/bin/jq}" ]; then
+    say ok "JSON via ${DRIVETHRU_JQ:-/usr/bin/jq}"
+  else
+    say ok "JSON via JavaScript for Automation (no /usr/bin/jq on this macOS)"
+  fi
+
+  f="/Applications/Google Drive.app/Contents/Info.plist"
+  if [ -f "$f" ]; then
+    v=$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$f" 2>/dev/null) || v="?"
+    say ok "Google Drive for desktop $v"
+  else
+    say warn "Google Drive for desktop not found in /Applications"
+  fi
+  for f in /Volumes/GoogleDrive*; do
+    [ -e "$f" ] && say warn "$f is a legacy (pre-File Provider) Drive mount; drivethru 0.1 doesn't support it"
+  done
+
+  if [ ${#MOUNTS[@]} = 0 ]; then
+    say FAIL "no Google Drive folders (GoogleDrive-*) in $ROOT_GIVEN; is Drive for desktop signed in?"
+    problems=$((problems + 1))
+    rc=2
+  else
+    say ok "${#MOUNTS[@]} Google Drive account(s) in $ROOT_DIR"
+    dfs=$(drivefs_dir)
+    for ((i = 0; i < ${#MOUNTS[@]}; i++)); do
+      line="${LABELS[i]} = ${EMAILS[i]}"
+      if ! mount_readable "${MOUNTS[i]}"; then
+        say FAIL "$line: $(perm_msg "${EMAILS[i]}")"
+        problems=$((problems + 1))
+        [ "$rc" = 0 ] && rc=6
+        continue
+      fi
+      mdc=0 cont=0
+      for f in "${MOUNTS[i]}"/*; do
+        [ -d "$f" ] && [ ! -L "$f" ] || continue
+        if [ -n "$(read_id "$f")" ]; then mdc=$((mdc + 1)); else cont=$((cont + 1)); fi
+      done
+      line="$line: My Drive $([ "$mdc" -gt 0 ] && printf found || printf 'NOT found')"
+      [ "$cont" -gt 0 ] && line="$line, $cont container folder(s)"
+      if [ "$CFG_DB" = off ]; then
+        line="$line, database check off (db = off)"
+      elif acct=$(drivefs_account_dir "$i"); then
+        if [ ! -f "$acct/metadata_sqlite_db" ]; then
+          line="$line, no DriveFS database (resource keys and shortcut stand-ins unavailable)"
+        elif db_ready "$i"; then
+          n=$(dbq "SELECT count(*) FROM items;")
+          line="$line, database readable (${n:-?} items)"
+        else
+          line="$line, DriveFS database unreadable or changed; using xattrs only"
+        fi
+      else
+        line="$line, no DriveFS account folder in $dfs"
+      fi
+      say ok "$line"
+    done
+  fi
+
+  f=$(config_file)
+  if [ -f "$f" ]; then
+    say ok "config $f"
+  else
+    say ok "no config file ($f); using defaults"
+  fi
+  for e in ${CFG_ERRORS[@]+"${CFG_ERRORS[@]}"}; do
+    say FAIL "config: $e"
+    problems=$((problems + 1))
+    [ "$rc" = 0 ] && rc=1
+  done
+  for e in ${CFG_UNKNOWN[@]+"${CFG_UNKNOWN[@]}"}; do
+    say warn "config line ${e%%:*}: unknown key \"${e#*: }\" (ignored)"
+  done
+  for e in ${CFG_JUNK[@]+"${CFG_JUNK[@]}"}; do
+    say warn "config line ${e%%:*}: not \"key = value\" (ignored)"
+  done
+
+  if [ "$CFG_BROWSER" = default ]; then
+    say ok "browser: the default browser, with authuser=<email>"
+  else
+    if [ -z "${DRIVETHRU_CHROME_DIR:-}" ]; then
+      browser_info
+      say ok "default browser: ${DEFAULT_BROWSER:-unknown}"
+    fi
+    # Check a forced channel even when Drive has no signed-in accounts yet.
+    for ((i = 0; i < ${#MOUNTS[@]} || i == 0; i++)); do
+      if ! browser_route "${EMAILS[i]:-}"; then
+        say FAIL "browser: $ROUTE_ERROR"
+        problems=$((problems + 1))
+        [ "$rc" = 0 ] && rc=1
+        break
+      fi
+      [ ${#MOUNTS[@]} -gt 0 ] || break
+      if [ "$ROUTE_KIND" = chrome ]; then
+        if [ -n "$ROUTE_PROFILE_DIR" ]; then
+          say ok "browser: ${EMAILS[i]} opens in $(chrome_name_for "$ROUTE_BUNDLE") profile \"$ROUTE_PROFILE_DIR\""
+        else
+          say ok "browser: ${EMAILS[i]} has no $(chrome_name_for "$ROUTE_BUNDLE") profile; Chrome picks the profile by email"
+        fi
+      else
+        say ok "browser: ${EMAILS[i]} has no Chrome profile; default browser with authuser=<email>"
+      fi
+    done
+  fi
+
+  v=$(lower "${DRIVETHRU_TERMINAL:-$CFG_TERMINAL}")
+  if resolve_terminal "$v"; then
+    case $v in '' | auto) v="$POPUP_TERMINAL (auto-detected)" ;; *) v=$POPUP_TERMINAL ;; esac
+    if parse_size "$CFG_POPUP_SIZE"; then
+      say ok "popup terminal: $v, $CFG_POPUP_SIZE"
+    fi
+  else
+    say FAIL "popup terminal: $TERMINAL_ERROR"
+    problems=$((problems + 1))
+    [ "$rc" = 0 ] && rc=1
+  fi
+  if [ -d "$HOME/Library/Services/Copy Google Drive Link.workflow" ]; then
+    say ok "Finder Quick Action installed"
+  else
+    say info "Finder Quick Action not installed (drivethru install-quick-action)"
+  fi
+  if [ "$problems" = 0 ]; then
+    printf 'No problems found.\n'
+  else
+    printf '%s problem(s) found.\n' "$problems"
+  fi
+  finish "$rc"
+}
+
+# -------------------------------------------------------------------- main --
+
+usage() {
+  cat <<EOF
+drivethru $VERSION - fuzzy-find Google Drive for desktop items and get their web links
+
+Usage:
+  drivethru [pick] [QUERY]          interactive picker (needs a terminal)
+  drivethru popup [QUERY]           open the picker in a new terminal window
+  drivethru link [OPTIONS] PATH...  print share links for paths
+      --copy        also put the result on the clipboard
+      --markdown    print [name](url) per line
+      --notify      show a macOS notification with the result
+      --            end of options
+  drivethru open PATH...            open paths in the browser as their account
+  drivethru search [OPTIONS] QUERY  non-interactive fuzzy search (no terminal)
+      --limit N     number of results (default 10)
+      --links       append each result's share link
+      --copy-first  copy the top result's link, print it and exit
+      -0, --null    end result records with NUL (safe for filename newlines)
+  drivethru list [-0|--null]         print every indexed item (label<TAB>path)
+  drivethru doctor                  check the setup and explain problems
+  drivethru install-quick-action    install the Finder Quick Action
+  drivethru --help | --version
+
+Picker keys:
+  enter   copy link(s)            ctrl-o  open in the browser
+  ctrl-f  reveal in Finder        ctrl-y  copy as Markdown links
+  tab     select several          ctrl-p  toggle the preview      esc  cancel
+
+Config: \$DRIVETHRU_CONFIG or ~/.config/drivethru/config ("key = value" lines:
+label.<email>, browser, terminal, popup_size, db, after_open, notify).
+
+Exit codes: 0 ok, 1 usage/config/action error or no match, 2 no Drive folders, 3 no Drive id
+(not uploaded, or not in Drive), 4 no share link for this item (My Drive,
+containers), 5 missing/failing dependency, 6 permission denied, 130 cancelled.
+Listing skips denied accounts with a warning; exit 6 means none were readable.
+
+drivethru never talks to Google: links come from metadata Drive for desktop
+keeps on disk.
+EOF
+}
+
+main() {
+  setup_path
+  find_self
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  load_config
+  discover_mounts
+  local cmd=${1:-}
+  case $cmd in
+    pick | popup | link | open | search | list | doctor | install-quick-action)
+      case ${2:-} in -h | --help) usage; exit 0 ;; esac
+      ;;
+  esac
+  case $cmd in
+    help | -h | --help) usage; exit 0 ;;
+    -V | --version) printf 'drivethru %s\n' "$VERSION"; exit 0 ;;
+    --in-popup) shift; IN_POPUP=1; cmd_pick "$@" ;;
+    pick) shift; cmd_pick "$@" ;;
+    popup) shift; cmd_popup "$@" ;;
+    link) shift; cmd_link "$@" ;;
+    open) shift; cmd_open "$@" ;;
+    search) shift; cmd_search "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    install-quick-action) shift; cmd_install_quick_action "$@" ;;
+    __preview) shift; cmd_preview "$@" ;;
+    --) shift; cmd_pick "$@" ;;
+    -?*) usage_error "unknown option: $cmd" ;;
+    *) cmd_pick "$@" ;;
+  esac
+}
+
+main "$@"
