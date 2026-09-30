@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: ShellCheck
+        run: shellcheck -s bash drivethru tests/*.sh extras/raycast/*.sh demo/*.sh
+
+      - name: Parse with the stock /bin/bash 3.2
+        run: |
+          /bin/bash --version | head -n 1
+          for f in drivethru tests/*.sh extras/raycast/*.sh demo/*.sh; do
+            /bin/bash -n "$f"
+          done
+
+      - name: Formula syntax
+        run: ruby -c packaging/drivethru.rb
+
+  test:
+    name: test (${{ matrix.os }}, fzf ${{ matrix.fzf }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            fzf: current
+          - os: macos-26
+            fzf: current
+          - os: macos-15
+            fzf: minimum
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install fzf
+        if: matrix.fzf == 'current'
+        run: brew install fzf
+
+      - name: Install minimum supported fzf (0.42.0)
+        if: matrix.fzf == 'minimum'
+        shell: bash
+        run: |
+          case "$(uname -m)" in
+            arm64)
+              fzf_arch=arm64
+              fzf_sha=f806879c0f63fc99e48e3b308f6c5e0c421ea2d031d282267242a70bc9a8df61
+              ;;
+            x86_64)
+              fzf_arch=amd64
+              fzf_sha=69f5c636c147a333ab9f0f929370c036156743cfb5f579a683f17a0db77efd0e
+              ;;
+            *) exit 1 ;;
+          esac
+          fzf_dir="$RUNNER_TEMP/fzf-minimum"
+          mkdir -p "$fzf_dir"
+          curl --fail --location --retry 3 \
+            "https://github.com/junegunn/fzf/releases/download/0.42.0/fzf-0.42.0-darwin_${fzf_arch}.zip" \
+            -o "$fzf_dir/fzf.zip"
+          printf '%s  %s\n' "$fzf_sha" "$fzf_dir/fzf.zip" | shasum -a 256 -c -
+          unzip -q "$fzf_dir/fzf.zip" -d "$fzf_dir"
+          printf 'DRIVETHRU_FZF=%s/fzf\n' "$fzf_dir" >>"$GITHUB_ENV"
+
+      - name: Versions
+        run: |
+          sw_vers
+          /bin/bash --version | head -n 1
+          "${DRIVETHRU_FZF:-fzf}" --version
+
+      - name: Run tests with /bin/bash
+        run: /bin/bash tests/run.sh

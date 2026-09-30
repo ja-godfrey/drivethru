@@ -1,0 +1,129 @@
+#!/usr/bin/expect -f
+# interactive.exp DRIVETHRU ERRFILE ACTION...
+#
+# Drives the real fzf picker (`DRIVETHRU pick`) on a 120x30 pseudo-terminal.
+# drivethru's stderr is mirrored to ERRFILE and the pty (older fzf versions
+# draw on stderr). Called by tests/run.sh, which sets DRIVETHRU_DRY_RUN=1, the
+# fixture paths and DRIVETHRU_CLIPBOARD_FILE in the environment.
+#
+# ACTION is one of
+#   type:TEXT     type TEXT into the query, then give fzf a moment to filter
+#   key:NAME      enter tab stab esc ctrl-o ctrl-y ctrl-f ctrl-u ctrl-p
+#   sleep:SECS    wait
+#   wait:TEXT     wait (up to 5 s) for TEXT to appear on screen
+#   arg:TEXT      (anywhere) pass TEXT as an argument: drivethru pick TEXT
+#   sub:WORD      (anywhere) run `drivethru WORD ...` instead of `drivethru pick ...`
+#
+# Exits with drivethru's exit status, or
+#   97  fzf's match counter never appeared
+#   98  drivethru did not exit after the last action
+
+set timeout 10
+if {[info exists env(VERBOSE)] && $env(VERBOSE) eq "1"} {
+  log_user 1
+} else {
+  log_user 0
+}
+
+if {[llength $argv] < 2} {
+  puts stderr "usage: interactive.exp DRIVETHRU ERRFILE ACTION..."
+  exit 2
+}
+set dt [lindex $argv 0]
+set errfile [lindex $argv 1]
+set actions {}
+set sub pick
+set pickargs {}
+foreach a [lrange $argv 2 end] {
+  if {[string match "sub:*" $a]} {
+    set sub [string range $a 4 end]
+  } elseif {[string match "arg:*" $a]} {
+    lappend pickargs [string range $a 4 end]
+  } else {
+    lappend actions $a
+  }
+}
+set env(TERM) xterm-256color
+# PICK_LOG=FILE keeps a transcript of the screen (for preview/header checks)
+if {[info exists env(PICK_LOG)] && $env(PICK_LOG) ne ""} {
+  log_file -noappend -a $env(PICK_LOG)
+}
+
+# A fresh pty reports 0x0; fzf draws nothing on it, so size it first.
+spawn -noecho /bin/bash -c {stty rows 30 columns 120; e=$1; shift; mkfifo "$e.pipe" || exit 2; tee "$e" <"$e.pipe" >&2 & t=$!; "$0" "$@" 2>"$e.pipe"; rc=$?; wait "$t"; rm -f "$e.pipe"; exit "$rc"} $dt $errfile $sub {*}$pickargs
+
+proc finish {} {
+  set r [wait]
+  exit [lindex $r 3]
+}
+
+expect {
+  -re {[0-9]+/[0-9]+} {}
+  eof { finish }
+  timeout { exit 97 }
+}
+# let the listing finish streaming in
+sleep 0.5
+
+foreach a $actions {
+  if {[string match "type:*" $a]} {
+    set text [string range $a 5 end]
+    # drop what is already on screen (list rows could contain TEXT)
+    expect -timeout 0 *
+    send -- $text
+    # wait for the prompt to echo the whole query ("...> TEXT"; fzf puts
+    # colour codes between the prompt and the query and redraws once per
+    # key), then for the match counter, then give fzf a moment to re-rank
+    regsub -all {[][{}()*+?.\\^$|]} $text {\\&} textre
+    expect {
+      -timeout 5
+      -re ">(\x1b\\\[\[0-9;\]*m| )*$textre" {}
+      timeout {}
+      eof { finish }
+    }
+    expect {
+      -timeout 3
+      -re {[0-9]+/[0-9]+} {}
+      timeout {}
+      eof { finish }
+    }
+    sleep 0.8
+  } elseif {[string match "key:*" $a]} {
+    set k [string range $a 4 end]
+    switch -- $k {
+      enter  { send -- "\r" }
+      tab    { send -- "\t" }
+      stab   { send -- "\033\[Z" }
+      esc    { send -- "\033" }
+      ctrl-o { send -- "\017" }
+      ctrl-y { send -- "\031" }
+      ctrl-f { send -- "\006" }
+      ctrl-u { send -- "\025" }
+      ctrl-p { send -- "\020" }
+      default {
+        puts stderr "interactive.exp: unknown key $k"
+        exit 2
+      }
+    }
+    sleep 0.4
+  } elseif {[string match "sleep:*" $a]} {
+    sleep [string range $a 6 end]
+  } elseif {[string match "wait:*" $a]} {
+    # A requested screen condition is an assertion, not just a delay.
+    expect {
+      -timeout 5
+      -ex [string range $a 5 end] {}
+      timeout { puts stderr "interactive.exp: expected screen text did not appear"; exit 96 }
+      eof { finish }
+    }
+  } else {
+    puts stderr "interactive.exp: unknown action $a"
+    exit 2
+  }
+}
+
+set timeout 15
+expect {
+  eof { finish }
+  timeout { exit 98 }
+}
