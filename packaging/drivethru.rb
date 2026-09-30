@@ -8,8 +8,8 @@ class Drivethru < Formula
   license "MIT"
   head "https://github.com/ja-godfrey/drivethru.git", branch: "main"
 
-  depends_on macos: :ventura
   depends_on "fzf"
+  depends_on macos: :ventura
 
   def install
     bin.install "drivethru"
