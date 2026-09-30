@@ -1,0 +1,23 @@
+{
+  "title": "drivethru",
+  "rules": [
+    {
+      "description": "drivethru: control-option-D opens the Google Drive picker popup",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "d",
+            "modifiers": {
+              "mandatory": ["control", "option"],
+              "optional": ["caps_lock"]
+            }
+          },
+          "to": [
+            { "shell_command": "/opt/homebrew/bin/drivethru popup" }
+          ]
+        }
+      ]
+    }
+  ]
+}
