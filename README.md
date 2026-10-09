@@ -6,10 +6,12 @@ link, or Ctrl-O to open it in the right Google Chrome profile.
 drivethru searches the Google Drive for desktop folders already on your Mac.
 It builds links from local metadata: no Google API, OAuth setup, or API key.
 
-![Search for a presentation, copy its link, then select budgets from two accounts](demo/demo.gif)
+**Find it. Copy the link.**
 
-*Recorded with made-up files and accounts. Browser and clipboard actions are
-simulated; the picker is real.*
+![Search for a board deck, press Enter, and see its copied Google Drive link](demo/demo.gif)
+
+*All demos use the real picker with made-up files and accounts. Browser and
+clipboard actions are simulated; final panels illustrate captured dry-run output.*
 
 ## Install
 
@@ -67,6 +69,10 @@ collisions use full email addresses.
 | Ctrl-P | Toggle the preview |
 | Esc | Cancel |
 
+**Copy several named links at once.** Select files with Tab, then press Ctrl-Y.
+
+![Search for budgets, select two files with Tab, and copy both as named Markdown links with Ctrl-Y](demo/markdown.gif)
+
 The preview shows the item type, account and modification time. The final
 link is resolved when you copy or open, so moving through the list does not
 read placeholder contents or query Drive's database.
@@ -99,6 +105,10 @@ It installs into `~/Library/Services`. If you later move the script, run the
 installer again to update the action's executable path.
 
 ## Accounts and configuration
+
+**Open in the right account.** Add an account label to your search, then press Ctrl-O.
+
+![Narrow a budget search to work, press Ctrl-O, and see the simulated route to the matching Work Chrome profile](demo/accounts.gif)
 
 With `browser = auto`, opening a link uses the installed Chrome profile
 matching its Google account, including Chrome Beta, Dev and Canary. If no
@@ -187,7 +197,8 @@ Tests use synthetic Drive folders and simulate clipboard, browser and popup
 actions. Dry-run mode also skips the configured `after_open` hook.
 See the [design and implementation notes](docs/DESIGN.md),
 [changelog](CHANGELOG.md) and [release guide](packaging/README.md).
-The demo can be regenerated with `vhs demo/demo.tape` after installing VHS;
-it also uses only synthetic files.
+Regenerate the demos with `./demo/render.sh`; see the
+[demo recording instructions](demo/README.md) for dependencies and how the
+simulated result panels work.
 
 MIT licensed. See [LICENSE](LICENSE).

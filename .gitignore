@@ -12,7 +12,7 @@
 # Local Claude Code settings
 .claude/settings.local.json
 
-# Demo scratch output (the committed GIF is demo/demo.gif)
+# Demo scratch output (captioned GIFs in demo/ are committed)
 demo/tree/
 demo/frames/
 demo/*.mp4
