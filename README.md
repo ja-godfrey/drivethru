@@ -1,17 +1,12 @@
 # drivethru
 
+![Drivethru searches Drive accounts together, copies links, filters by account, and opens files in the matching Chrome profile](demo/teaser.gif)
+
 Find a file in any of your Google Drive accounts. Press Enter to copy its web
 link, or Ctrl-O to open it in the right Google Chrome profile.
 
 drivethru searches the Google Drive for desktop folders already on your Mac.
 It builds links from local metadata: no Google API, OAuth setup, or API key.
-
-**Find it. Copy the link.**
-
-![Search for a board deck, press Enter, and see its copied Google Drive link](demo/demo.gif)
-
-*All demos use the real picker with made-up files and accounts. Browser and
-clipboard actions are simulated; final panels illustrate captured dry-run output.*
 
 ## Install
 
@@ -54,6 +49,8 @@ drivethru search --limit 5 'budget'
 drivethru search --copy-first 'board deck'
 drivethru doctor
 ```
+
+See the [search and copy demo](demo/demo.gif) for the basic workflow.
 
 Type an account label as part of the query to narrow the results. Labels
 default to the Gmail username or the first part of a work/school domain;
@@ -197,7 +194,8 @@ Tests use synthetic Drive folders and simulate clipboard, browser and popup
 actions. Dry-run mode also skips the configured `after_open` hook.
 See the [design and implementation notes](docs/DESIGN.md),
 [changelog](CHANGELOG.md) and [release guide](packaging/README.md).
-Regenerate the demos with `./demo/render.sh`; see the
+Regenerate the teaser with `./demo/render-teaser.sh` and the three focused
+demos with `./demo/render.sh`; see the
 [demo recording instructions](demo/README.md) for dependencies and how the
 simulated result panels work.
 
